@@ -28,7 +28,7 @@ import vllm.envs as vllm_envs
 from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torchax.interop import jax_view, torch_view
-from torchax.ops.mappings import TORCH_DTYPE_TO_JAX
+from torchax.ops.mappings import TORCH_DTYPE_TO_JAX, t2j
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.ir import enable_torch_wrap
@@ -59,6 +59,9 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.vllm.experimental.model_patcher import patch_mm_model
 from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
     maybe_apply_qwen3_vl_patches
+from tpu_inference.models.vllm.experimental.vision_tower_jit import (
+    maybe_jit_embed_multimodal_func, maybe_precompile_vision_encoder_fn,
+    maybe_prepare_for_jit)
 from tpu_inference.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context, set_vllm_model_wrapper_context)
 from tpu_inference.runner.lora_utils import replace_lora_metadata
@@ -397,23 +400,57 @@ class VllmModelWrapper:
 
         return draft_step_fun if self.is_draft_model else step_fun
 
+    def wrap_precompile_vision_encoder_fn(
+        self,
+        params: Any,
+    ) -> Optional[Any]:
+        """Return a precompile function for the vision encoder, or None."""
+        if not self.vllm_config.model_config.is_multimodal_model:
+            return None
+        embed_multimodal_fn = self.wrap_embed_multimodal_func()
+        return maybe_precompile_vision_encoder_fn(params, embed_multimodal_fn,
+                                                  self.model.vllm_model,
+                                                  self.vllm_config)
+
     def wrap_embed_multimodal_func(self):
         if not self.vllm_config.model_config.is_multimodal_model:
             return None
 
-        # The function cannot be JITted directly due to its dynamic implementation
-        def embed_multimodal_func(
+        def embed_multimodal_func_jax(
             params_and_buffers: Any,
             **kwargs,
         ) -> Any:
+            call_kwargs = {
+                k: jax.tree.map(torch_view, v)
+                for k, v in kwargs.items()
+            }
 
+            output_from_torch = torch.func.functional_call(
+                self.model,
+                torch_view(params_and_buffers),
+                kwargs={
+                    "call_method": "embed_multimodal",
+                    "call_args": (),
+                    "call_kwargs": call_kwargs,
+                },
+                tie_weights=False,
+            )
+
+            return jax_view(output_from_torch)
+
+        def embed_multimodal_func_torch(params_and_buffers: Any,
+                                        **kwargs) -> Any:
+            # embed_multimodal_func_jax requires kwargs to be jax.Array such that jit can work
+            # Here we move_to_jax, then call (maybe jit'ed) embed_multimodal_func_jax.
             with torchax.default_env(), enable_torch_wrap(False):
+
+                kwargs = maybe_prepare_for_jit(kwargs, self.model.vllm_model)
 
                 def move(v: torch.Tensor) -> torch.Tensor:
                     if not isinstance(v, torch.Tensor):
                         logger.warning(f"Expect torch.Tensor, got {type(v)}")
                         return v
-                    return v.to(device="jax")
+                    return t2j(v, use_dlpack=False)
 
                 # Ensure all tensors are moved into accelerator so the
                 # computation with weights can work properly.
@@ -421,20 +458,11 @@ class VllmModelWrapper:
                     k: jax.tree.map(move, v)
                     for k, v in kwargs.items()
                 }
-                output_from_torch = torch.func.functional_call(
-                    self.model,
-                    torch_view(params_and_buffers),
-                    kwargs={
-                        "call_method": "embed_multimodal",
-                        "call_args": (),
-                        "call_kwargs": call_kwargs,
-                    },
-                    tie_weights=False,
-                )
+                return maybe_jit_embed_multimodal_func(
+                    embed_multimodal_func_jax,
+                    self.model.vllm_model)(params_and_buffers, **call_kwargs)
 
-                return jax_view(output_from_torch)
-
-        return embed_multimodal_func
+        return embed_multimodal_func_torch
 
     def wrap_embed_input_ids_func(self):
         if not self.vllm_config.model_config.is_multimodal_model:
