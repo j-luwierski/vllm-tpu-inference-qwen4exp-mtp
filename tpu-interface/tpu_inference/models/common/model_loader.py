@@ -59,6 +59,12 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
     "Qwen3MoeForCausalLM",
     "KimiK25ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen3.8-Flash-Next (Qwen4Exp): torchax port lives in
+    # tpu_inference/models/vllm/experimental/qwen4_exp and is registered
+    # over vLLM's CUDA/ROCm-only classes; route it to the torchax path
+    # directly instead of relying on the flax_nnx fallback.
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpMTP",
 })
 
 # List of architectures that don't have pipeline parallelism support in jax yet.

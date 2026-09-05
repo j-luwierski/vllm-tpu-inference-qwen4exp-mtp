@@ -19,6 +19,12 @@
 _TPU_VLLM_MODELS = {
     "DeepseekV4ForCausalLM":
     "tpu_inference.models.vllm.experimental.deepseek_v4:DeepseekV4ForCausalLM",
+    # Qwen4Exp = Qwen3.8-Flash-Next. The text-only causal LM and the MTP
+    # draft head; the multimodal wrapper stays CUDA/ROCm-only for now.
+    "Qwen4ExpForCausalLM":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpForCausalLM",
+    "Qwen4ExpMTP":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpMTP",
 }
 
 
