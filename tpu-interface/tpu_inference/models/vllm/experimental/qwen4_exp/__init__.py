@@ -15,7 +15,17 @@
 
 The architecture classes here are registered over vLLM's built-in ones (the
 latter refuse to load on TPU and are CUDA/ROCm-specific) via
-``tpu_inference.models.vllm.experimental._TPU_VLLM_MODELS``.
+``tpu_inference/models/vllm/experimental/_TPU_VLLM_MODELS``.
+
+Phase B (JAX-native / Flax NNX) status: intentionally deferred. The torchax
+path already routes this model's GDN layers through the JAX GDN Pallas
+kernels (``tpu_inference.kernels.gdn``) and its MoE through the registered
+TPU MoE runner, so a parallel Flax NNX reimplementation of GDN + QSA + PLE +
+HC + MoE would duplicate roughly five thousand lines of untestable code
+without any TPU to validate either path. A JAX-native port should start
+from the QSA/PLE math isolated in ``qsa.py``/``ple.py`` (all state-machine
+logic is plain jnp there) once the torchax path has been validated on real
+hardware.
 """
 
 from tpu_inference.models.vllm.experimental.qwen4_exp.model import (

@@ -35,7 +35,6 @@ integration can land without further model-side changes.
 """
 
 from collections.abc import Iterable
-import regex as re
 from typing import Optional, Tuple, Union
 
 import torch

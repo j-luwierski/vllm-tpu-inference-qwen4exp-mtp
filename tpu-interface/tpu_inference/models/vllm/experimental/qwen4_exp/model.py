@@ -132,7 +132,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
         self.config = config
@@ -173,7 +172,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.self_attn = Qwen3NextAttention(
                     config,
                     model_config=model_config,
-                    cache_config=cache_config,
+                    cache_config=vllm_config.cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                 )

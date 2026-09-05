@@ -84,7 +84,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
@@ -649,6 +649,17 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
+
+    def get_attn_backend(self) -> type:
+        """TPU attention backend interface stub.
+
+        The TPU runner builds the cache spec from this layer's attributes
+        and does not dispatch through an attention backend; the standard
+        TPU FLASH_ATTN backend is reported for interface compatibility.
+        """
+        from tpu_inference.layers.vllm.backends.flash_attn import \
+            PallasAttentionBackend
+        return PallasAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return FullAttentionSpec(

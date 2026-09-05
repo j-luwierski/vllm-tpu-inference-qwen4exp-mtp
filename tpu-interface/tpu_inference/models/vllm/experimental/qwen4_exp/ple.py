@@ -394,18 +394,30 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def _load_embedding_shard(self, param: torch.Tensor,
                               loaded_weight: torch.Tensor,
                               checkpoint_start: int) -> None:
-        """Copy the shard rows overlapping this rank's vocabulary range."""
-        # The TPU PLE table is TP-replicated (like the reference's
-        # disable_tp kv_proj and replicated conv state), so the full shard
-        # range maps onto the full table.
-        rows = min(loaded_weight.shape[0],
-                   param.shape[0] - checkpoint_start)
-        if rows <= 0:
+        """Copy the shard rows overlapping this rank's vocabulary range.
+
+        Port of ``copy_ple_embedding_shard_``: the table stays
+        vocab-parallel, so a checkpoint shard can span several TP ranks.
+        """
+        shard_indices = getattr(self.ngram_embedding, "shard_indices", None)
+        if shard_indices is None:
+            tp_start, tp_end = 0, param.shape[0]
+        else:
+            tp_start = shard_indices.org_vocab_start_index
+            tp_end = shard_indices.org_vocab_end_index
+        overlap_start = max(checkpoint_start, tp_start)
+        overlap_end = min(checkpoint_start + loaded_weight.shape[0], tp_end)
+        if overlap_start >= overlap_end:
             return
+        source_start = overlap_start - checkpoint_start
+        dest_start = overlap_start - tp_start
+        row_count = overlap_end - overlap_start
         with torch.no_grad():
-            param.data[checkpoint_start:checkpoint_start +
-                       rows].copy_(loaded_weight[:rows].to(
-                           param.data.dtype))
+            param.data[dest_start:dest_start +
+                       row_count].copy_(loaded_weight[source_start:
+                                                      source_start +
+                                                      row_count].to(
+                                                          param.data.dtype))
 
 
 def _grouped_norm(x: torch.Tensor, weight: torch.Tensor,
@@ -535,8 +547,10 @@ class Qwen4ExpPLELayer(nn.Module):
             dtype=torch.int32,
             prefix=f"{prefix}.ngram_ring",
         )
-        self._ngram_ring_size = self.ngram_heads_vocab_sizes
-        self._ngram_ring_offsets = self.ngram_heads_offsets
+        # Wired lazily on first forward: after weight loading these
+        # buffers turn into device-resident torchax tensors.
+        self._head_sizes = None
+        self._head_offsets = None
 
     # ------------------------------------------------------------------
     def _compute_ngram_ids(self, input_ids: jax.Array, positions: jax.Array,
@@ -556,6 +570,12 @@ class Qwen4ExpPLELayer(nn.Module):
         heads = self.heads_per_ngram
         ring_cap = ctx_ring.shape[1]
         num_tokens = input_ids.shape[0]
+        if self._head_sizes is None:
+            sizes_all = jax_view(self.ngram_heads_vocab_sizes).astype(
+                jnp.int64)
+            offsets_all = jax_view(self.ngram_heads_offsets).astype(jnp.int64)
+            self._head_sizes = sizes_all
+            self._head_offsets = offsets_all
         req = jnp.clip(token_to_req, 0, seq_lens.shape[0] - 1)
         slot_r = self._ple_slots[req]
         nc_r = (seq_lens -
@@ -589,8 +609,9 @@ class Qwen4ExpPLELayer(nn.Module):
         ], axis=0)
         shifted = jnp.where(valid_shift, vals, self.eos_token_id)  # [n, T]
 
-        mult = self.layer_multipliers.to(torch.int64).numpy().astype(
-            jnp.int64)  # [n]
+        # jax_view, not .numpy(): inside the jitted step these buffers are
+        # device-resident torchax tensors.
+        mult = jax_view(self.layer_multipliers).astype(jnp.int64)  # [n]
         mixed = shifted * mult[:, None]
         id_blocks = []
         for ngram in range(2, n + 1):
@@ -598,10 +619,8 @@ class Qwen4ExpPLELayer(nn.Module):
             for j in range(1, ngram):
                 acc = jnp.bitwise_xor(acc, mixed[j])
             start = (ngram - 2) * heads
-            sizes = self._ngram_ring_size.numpy().astype(
-                jnp.int64)[start:start + heads]
-            offsets = self._ngram_ring_offsets.numpy().astype(
-                jnp.int64)[start:start + heads]
+            sizes = self._head_sizes[start:start + heads]
+            offsets = self._head_offsets[start:start + heads]
             ids = jnp.remainder(acc[:, None], sizes[None, :]) + \
                 offsets[None, :]
             id_blocks.append(ids)
@@ -680,8 +699,9 @@ class Qwen4ExpPLELayer(nn.Module):
         ngram_ids = self._compute_ngram_ids(jids, jpos, token_to_req, valid,
                                             seq_lens, qsl, ctx_ring)
         ids_t = torch_view(ngram_ids)
-        embeddings = nn.functional.embedding(ids_t,
-                                             self.ngram_embedding.weight)
+        # Vocab-parallel lookup through the module so TP-sharded rows map
+        # correctly (mirrors the reference's ngram_embedding(ngram_ids)).
+        embeddings = self.ngram_embedding(ids_t)
         embeddings = embeddings.reshape(num_tokens, -1)
         embeddings = self.ple_embedding.dequantize(
             embeddings, hidden_states.dtype)
