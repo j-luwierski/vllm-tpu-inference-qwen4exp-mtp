@@ -193,16 +193,22 @@ def vllm_config(tpu_env, tmp_path_factory):
     import vllm.distributed as vd
     dummy = tmp_path_factory.mktemp("dummy_model") / "dummy"
     dummy.mkdir()
+    # A MoE model config: initialize_model_parallel creates the expert
+    # parallel group only for MoE configs, and the qwen4_exp test modules
+    # share one pytest process.
     (dummy / "config.json").write_text(
         """{
-  "architectures": ["Qwen3ForCausalLM"],
-  "model_type": "qwen3",
+  "architectures": ["Qwen3MoeForCausalLM"],
+  "model_type": "qwen3_moe",
   "hidden_size": 8,
   "num_hidden_layers": 1,
   "num_attention_heads": 2,
   "num_key_value_heads": 2,
   "head_dim": 4,
-  "intermediate_size": 8,
+  "moe_intermediate_size": 8,
+  "num_experts": 4,
+  "num_experts_per_tok": 2,
+  "shared_expert_intermediate_size": 8,
   "vocab_size": 32,
   "rms_norm_eps": 1e-6,
   "max_position_embeddings": 64
@@ -215,7 +221,10 @@ def vllm_config(tpu_env, tmp_path_factory):
     # Keep the config context active for the whole test module: vLLM ops
     # (get_rope, linears) read the current config at construction time.
     with set_current_vllm_config(config):
-        vd.initialize_model_parallel(tensor_model_parallel_size=1)
+        # Shared with the other qwen4_exp test modules in one pytest run.
+        from vllm.distributed import parallel_state as _ps
+        if _ps._TP is None:
+            vd.initialize_model_parallel(tensor_model_parallel_size=1)
         yield config
 
 

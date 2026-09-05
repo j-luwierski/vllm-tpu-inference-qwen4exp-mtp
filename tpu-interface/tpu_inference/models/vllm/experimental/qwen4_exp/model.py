@@ -104,6 +104,17 @@ _QWEN4_EXP_SKIPPED_SUBSTRS = (
     "hyper_connection_mixer.block_inject_weight",
 )
 
+# The CUDA reference stacks the PLE key/value projections into one merged
+# kv_proj for GEMM dispatch; the checkpoint stores them separately and the
+# mapper routes the rows into the merged module's shards. The HC down/inject
+# projections are NOT stacked here: the TPU GatedResidual keeps the
+# checkpoint-native separate weights.
+_QWEN4_EXP_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
+    orig_to_new_stacked={
+        "ple.key_proj": ("ple.kv_proj", 0),
+        "ple.value_proj": ("ple.kv_proj", 1),
+    })
+
 hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
 
 
@@ -366,9 +377,9 @@ class Qwen4ExpModel(nn.Module):
 
     def load_weights(self,
                      weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
-        mapper = hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={substr: None
-                                for substr in _QWEN4_EXP_SKIPPED_SUBSTRS})
+        mapper = hf_to_vllm_mapper | _QWEN4_EXP_EXTRA_WEIGHTS_MAPPER \
+            | WeightsMapper(orig_to_new_substr={
+                substr: None for substr in _QWEN4_EXP_SKIPPED_SUBSTRS})
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.
