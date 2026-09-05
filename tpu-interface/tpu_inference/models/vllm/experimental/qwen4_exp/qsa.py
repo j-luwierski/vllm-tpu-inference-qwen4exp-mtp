@@ -367,8 +367,8 @@ def _qsa_update_raw_and_pool(
     write_ok = valid & (seq_lens[req] > 0) & (slot_r >= 0)
     raw_flat = raw_cache.reshape(-1, 1, head_dim)
     raw_slot = jnp.where(write_ok, slot_r * raw_cap + pos % raw_cap, 0)
-    write_vals = jnp.where(write_ok[:, None], raw_keys,
-                           jnp.zeros_like(raw_keys))
+    write_vals = jnp.where(write_ok[:, None, None], raw_keys[:, None, :],
+                           jnp.zeros_like(raw_keys)[:, None, :])
     new_raw_flat = raw_flat.at[raw_slot].set(write_vals)
     new_raw_cache = new_raw_flat.reshape(raw_cache.shape)
 
@@ -443,7 +443,7 @@ def _qsa_select_and_store(
         idx = jnp.clip(
             slot_r[:, None] * comp_cap + g[None, :], 0,
             new_comp_flat.shape[0] - 1)
-        kg = new_comp_flat[idx][:, 0, :].astype(jnp.float32)
+        kg = new_comp_flat[idx][:, :, 0, :].astype(jnp.float32)
         scores = jnp.einsum("thd,tgd->thg", q_sel.astype(jnp.float32), kg)
         scores = jax.nn.relu(scores).sum(axis=1) / math.sqrt(head_dim)
         scores = jnp.where(g[None, :] < visible_groups[:, None], scores,
@@ -466,9 +466,10 @@ def _qsa_select_and_store(
     visible_tokens = pos + 1
     seq_r = seq_lens[req]
     expanded = blocks[:, :, None] * cr + jnp.arange(cr)[None, None, :]
-    expanded = expanded.reshape(num_tokens, block_topk * cr)
-    exp_valid = (blocks >= 0)[:, :, None] & (expanded < seq_r[:, None])
-    expanded = jnp.where(exp_valid, expanded, -1)
+    exp_valid = ((blocks >= 0)[:, :, None] &
+                 (expanded < seq_r[:, None, None]))
+    expanded = jnp.where(exp_valid, expanded,
+                         -1).reshape(num_tokens, block_topk * cr)
     tail_start = (visible_tokens // cr) * cr
     tail = tail_start[:, None] + jnp.arange(cr - 1)[None, :]
     tail_valid = (jnp.arange(cr - 1)[None, :] <

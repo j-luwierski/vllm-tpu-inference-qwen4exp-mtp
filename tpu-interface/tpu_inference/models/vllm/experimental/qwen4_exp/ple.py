@@ -50,6 +50,11 @@ TPU-specific engineering decisions (deliberate, none silent):
   directly, which is equivalent for the flat batch layout.
 * FP8 embedding rows are dequantized after lookup with the checkpoint's
   single global scale, matching ``Qwen4ExpPLEFp8EmbeddingMethod``.
+* KNOWN CONSTRAINT: the n-gram hash needs 64-bit integer wraparound.
+  JAX with ``jax_enable_x64=False`` (torchax performance mode) silently
+  downcasts int64 to int32, so the layer refuses to build unless x64 is
+  enabled (torchax ``enable_accuracy_mode()``) — a 32-bit-limb hash
+  reimplementation is the follow-up that removes the requirement.
 """
 
 import math
@@ -528,6 +533,19 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
 
+        # The n-gram hash multiplies 64-bit checkpoints constants and
+        # relies on int64 wraparound; with JAX x64 disabled jnp silently
+        # downcasts int64 to int32 and the ids would be corrupt. Fail
+        # closed instead (remediation: run with torchax accuracy mode /
+        # jax_enable_x64, or reimplement the hash in 32-bit limbs).
+        if not jax.config.jax_enable_x64:
+            raise RuntimeError(
+                "Qwen4Exp PLE n-gram hashing requires 64-bit integer "
+                "arithmetic. Enable jax_enable_x64 (e.g. torchax."
+                "enable_accuracy_mode()) before loading the model, or "
+                "reimplement the hash in 32-bit limbs; with x64 disabled "
+                "the ids would be silently wrong.")
+
         self.ngram_context_len = max(int(config.ngram_size) - 1, 0)
         # Ring capacities include the speculative slack so rejected draft
         # writes cannot alias committed history (functional reads).
@@ -643,7 +661,11 @@ class Qwen4ExpPLELayer(nn.Module):
 
         src_pos = pos[:, None] - jnp.arange(
             self.conv_kernel_size)[None, :] * self.short_conv_dilation
+        # A tap is valid only inside the request's committed+chunked
+        # history: positions before the request's start (src_pos < 0)
+        # contribute zero, matching the reference's EOS-segment clamping.
         in_batch = src_pos >= nc_r[:, None]
+        use_ring = (~in_batch) & (src_pos >= 0)
         batch_idx = jnp.clip(
             query_start_loc[req][:, None] + (src_pos - nc_r[:, None]), 0,
             num_tokens - 1)
@@ -652,7 +674,9 @@ class Qwen4ExpPLELayer(nn.Module):
                             conv_ring.shape[0] * cap - 1)
         ring_vals = conv_ring.reshape(-1, 1, channels)[ring_idx][:, :, 0]
         vals = jnp.where(in_batch[..., None], batch_vals,
-                         ring_vals).astype(jnp.float32)
+                         jnp.where(use_ring[..., None], ring_vals,
+                                   jnp.zeros_like(ring_vals))).astype(
+                                       jnp.float32)
         weight = self.conv1d.weight.squeeze(1).detach()
         weight = jax_view(weight).astype(jnp.float32)  # [C, K]
         out = jnp.einsum("tkc,ck->tc", vals, weight)
@@ -662,8 +686,9 @@ class Qwen4ExpPLELayer(nn.Module):
         write_ok = valid & (seq_lens[req] > 0) & (slot_r >= 0)
         ring_flat = conv_ring.reshape(-1, 1, channels)
         write_slot = jnp.where(write_ok, slot_r * cap + pos % cap, 0)
-        write_vals = jnp.where(write_ok[:, None], conv_input,
-                               jnp.zeros_like(conv_input))
+        write_vals = jnp.where(write_ok[:, None, None],
+                               conv_input[:, None, :],
+                               jnp.zeros_like(conv_input)[:, None, :])
         new_ring = ring_flat.at[write_slot].set(write_vals)
         return delta, new_ring.reshape(conv_ring.shape)
 
