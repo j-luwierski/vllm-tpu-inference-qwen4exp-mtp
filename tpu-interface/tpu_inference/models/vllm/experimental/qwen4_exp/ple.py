@@ -62,6 +62,7 @@ from typing import Iterable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 from torch import nn
 from torchax.interop import jax_view, torch_view
@@ -70,8 +71,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import \
-    VocabParallelEmbedding
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -302,19 +301,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # FP8 PLE checkpoints store the whole table quantized with one
         # global scale (see Qwen4ExpPLEFp8EmbeddingMethod in the reference).
         self.fp8 = False
-        weight_dtype = params_dtype
         if quant_config is not None and getattr(quant_config, "get_name",
                                                 lambda: "")() == "fp8":
             if getattr(quant_config, "is_checkpoint_fp8_serialized", False):
                 self.fp8 = True
-                weight_dtype = torch.float8_e4m3fn
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=weight_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-        )
+
+        # Host-offloaded n-gram table: [padded_vocab, head_dim] rows.
+        # At the released checkpoint's scale this is 47.75 GiB — v5e-8
+        # (8 x 16 GiB HBM) cannot hold it next to the MoE experts
+        # (verified on hardware: per-chip placement of the PLE chunk hits
+        # RESOURCE_EXHAUSTED with 1.08 GiB free). The table therefore never
+        # becomes a device parameter: it is a plain numpy attribute
+        # (invisible to state_dict and to the runner's device_put), and the
+        # forward gathers the rows it needs per step through
+        # jax.pure_callback (see gather_host). Raw uint8 storage because
+        # numpy has no e4m3 dtype; the device reinterprets the bytes after
+        # the H2D copy. The bf16 (non-FP8) path stores ml_dtypes.bfloat16.
+        if self.fp8:
+            self._host_dtype = np.uint8
+            self._row_device_dtype = jnp.float8_e4m3fn
+        else:
+            import ml_dtypes
+            self._host_dtype = np.dtype(ml_dtypes.bfloat16)
+            self._row_device_dtype = jnp.bfloat16
+        self.host_table = np.zeros((padded_vocab_size, self.head_dim),
+                                   dtype=self._host_dtype)
         # NOTE: use register_parameter(name, None) rather than a plain
         # attribute assignment for the no-FP8 case; a plain `self.weight_scale
         # = None` would put the name into __dict__, and torch's
@@ -339,6 +350,46 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             raise RuntimeError("FP8 PLE embedding is missing its scale")
         return embeddings.to(output_dtype) * self.weight_scale.to(
             output_dtype)
+
+    # ------------------------------------------------------------------
+    # Host-offloaded lookup
+    # ------------------------------------------------------------------
+    def _gather_rows_host(self, ids_np: np.ndarray) -> np.ndarray:
+        """Pure host-side row gather; runs inside jax.pure_callback.
+
+        ids_np holds global row indices into the padded n-gram vocab
+        (bounded by the per-head prime layouts, well inside int32).
+        Fancy-indexing the host table copies exactly the requested rows.
+        """
+        return self.host_table[ids_np]
+
+    def gather_host(self, ids_t: torch.Tensor) -> torch.Tensor:
+        """Gather rows for global ids from the host-resident table.
+
+        Replaces the on-device vocab-parallel embedding lookup. ids
+        [..., ngram_heads] cross D2H (a few hundred KB), the row block
+        [..., head_dim] is gathered from host RAM and crosses H2D (a few
+        MB at the 2048-token prefill bucket). Runs as a jax.pure_callback
+        so it composes with the runner's jax.jit step function; the ids
+        are TP-replicated by construction (derived from the replicated
+        token stream and the TP-replicated PLE caches), so the callback
+        executes once per step and the rows stay TP-replicated, matching
+        the TP-replicated kv_proj downstream.
+        """
+        ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
+        ids_j = jax.lax.with_sharding_constraint(ids_j,
+                                                 jax.sharding.PartitionSpec())
+        rows = jax.pure_callback(
+            self._gather_rows_host,
+            jax.ShapeDtypeStruct((ids_j.shape[0], self.head_dim),
+                                 self._row_device_dtype),
+            ids_j,
+        )
+        if self.fp8:
+            rows = rows.view(jnp.float8_e4m3fn)
+        # [T, heads, head_dim] flattened exactly like the reference's
+        # ngram_embedding(ngram_ids).reshape(num_tokens, -1).
+        return torch_view(rows).reshape(ids_t.shape[0], -1)
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> set:
@@ -388,21 +439,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     raise ValueError(
                         f"PLE embedding shard index {shard_index} exceeds "
                         f"split_ngram_parts={self.split_ngram_parts}")
-                embedding = self.ngram_embedding
                 shard_size = (self.org_vocab_size + self.split_ngram_parts -
                               1) // self.split_ngram_parts
                 checkpoint_start = shard_index * shard_size
                 expected_rows = max(
                     0,
                     min(shard_size, self.org_vocab_size - checkpoint_start))
-                expected_shape = (expected_rows, embedding.embedding_dim)
+                expected_shape = (expected_rows, self.head_dim)
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"Shape mismatch for PLE embedding shard "
                         f"{shard_index}: expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}")
-                self._load_embedding_shard(embedding.weight, loaded_weight,
-                                           checkpoint_start)
+                self._load_embedding_shard(loaded_weight, checkpoint_start)
                 loaded.add("ngram_embedding.weight")
                 continue
             regular_weights.append((name, loaded_weight))
@@ -413,33 +462,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
 
-    def _load_embedding_shard(self, param: torch.Tensor,
+    def _load_embedding_shard(self,
                               loaded_weight: torch.Tensor,
                               checkpoint_start: int) -> None:
-        """Copy the shard rows overlapping this rank's vocabulary range.
+        """Copy a checkpoint shard's rows into the host-resident table.
 
-        Port of ``copy_ple_embedding_shard_``: the table stays
-        vocab-parallel, so a checkpoint shard can span several TP ranks.
+        The table is host-resident and TP-replicated (one full table per
+        process; the host is shared by all mesh devices), so each
+        checkpoint shard maps to one contiguous row range — no
+        rank-overlap math. Rows are stored as raw bytes (uint8 for e4m3,
+        uint16-viewed for bf16) because numpy has no torch fp8/bf16
+        equivalent for the e4m3 case; the device reinterprets after H2D.
         """
-        shard_indices = getattr(self.ngram_embedding, "shard_indices", None)
-        if shard_indices is None:
-            tp_start, tp_end = 0, param.shape[0]
+        rows = loaded_weight.shape[0]
+        dst = self.host_table[checkpoint_start:checkpoint_start + rows]
+        if self.fp8:
+            src = (loaded_weight.reshape(rows, self.head_dim).contiguous()
+                   .view(torch.uint8).cpu().numpy())
         else:
-            tp_start = shard_indices.org_vocab_start_index
-            tp_end = shard_indices.org_vocab_end_index
-        overlap_start = max(checkpoint_start, tp_start)
-        overlap_end = min(checkpoint_start + loaded_weight.shape[0], tp_end)
-        if overlap_start >= overlap_end:
-            return
-        source_start = overlap_start - checkpoint_start
-        dest_start = overlap_start - tp_start
-        row_count = overlap_end - overlap_start
-        with torch.no_grad():
-            param.data[dest_start:dest_start +
-                       row_count].copy_(loaded_weight[source_start:
-                                                      source_start +
-                                                      row_count].to(
-                                                          param.data.dtype))
+            src = (loaded_weight.reshape(rows, self.head_dim).contiguous()
+                   .view(torch.uint16).cpu().numpy().view(self._host_dtype))
+        if src.shape != dst.shape:
+            raise ValueError(
+                f"PLE host table copy shape mismatch: expected "
+                f"{dst.shape}, got {src.shape}")
+        dst[...] = src
 
 
 def _grouped_norm(x: torch.Tensor, weight: torch.Tensor,
@@ -742,9 +789,11 @@ class Qwen4ExpPLELayer(nn.Module):
         ngram_ids = self._compute_ngram_ids(jids, jpos, token_to_req, valid,
                                             seq_lens, qsl, ctx_ring)
         ids_t = torch_view(ngram_ids)
-        # Vocab-parallel lookup through the module so TP-sharded rows map
-        # correctly (mirrors the reference's ngram_embedding(ngram_ids)).
-        embeddings = self.ngram_embedding(ids_t)
+        # Host-offloaded lookup: the 47.75 GiB table lives in host RAM;
+        # gather_host crosses D2H(ids)/H2D(rows) through jax.pure_callback
+        # and returns the same [T, heads*head_dim] fp8 block the on-device
+        # vocab-parallel embedding produced.
+        embeddings = self.ple_embedding.gather_host(ids_t)
         embeddings = embeddings.reshape(num_tokens, -1)
         embeddings = self.ple_embedding.dequantize(
             embeddings, hidden_states.dtype)
