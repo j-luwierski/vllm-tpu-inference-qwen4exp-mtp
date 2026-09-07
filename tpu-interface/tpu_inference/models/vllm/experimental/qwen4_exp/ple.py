@@ -377,8 +377,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         the TP-replicated kv_proj downstream.
         """
         ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
-        ids_j = jax.lax.with_sharding_constraint(ids_j,
-                                                 jax.sharding.PartitionSpec())
+        # Make the TP-replication explicit for the compiler when a mesh is
+        # active (the runner sets one); skip in bare-CPU / no-mesh contexts
+        # (unit tests), where the constraint would raise.
+        if jax.sharding.get_mesh().size:
+            ids_j = jax.lax.with_sharding_constraint(
+                ids_j, jax.sharding.PartitionSpec())
         rows = jax.pure_callback(
             self._gather_rows_host,
             jax.ShapeDtypeStruct((ids_j.shape[0], self.head_dim),
