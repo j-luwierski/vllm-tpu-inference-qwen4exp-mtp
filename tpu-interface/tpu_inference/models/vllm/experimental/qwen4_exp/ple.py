@@ -367,6 +367,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(buffer.device))
                 loaded.add(name)
                 continue
+            if name in ("ngram_embedding.weight_scale", "weight_scale"):
+                # The checkpoint stores the FP8 global scale under the
+                # embedding submodule (checkpoint-native name
+                # "ngram_embedding.weight_scale", matching the CUDA
+                # reference, which registers weight_scale inside the
+                # embedding layer); this port keeps the parameter on the
+                # Qwen4ExpNGramEmbedding wrapper itself.
+                if self.weight_scale is not None:
+                    self._load_weight_scale(self.weight_scale, loaded_weight)
+                    loaded.add("weight_scale")
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix):-len(".weight")]
                 if not shard_text.isdigit():
