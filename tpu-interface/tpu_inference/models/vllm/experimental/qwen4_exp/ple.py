@@ -541,16 +541,17 @@ class Qwen4ExpPLELayer(nn.Module):
 
         # The n-gram hash multiplies 64-bit checkpoints constants and
         # relies on int64 wraparound; with JAX x64 disabled jnp silently
-        # downcasts int64 to int32 and the ids would be corrupt. Fail
-        # closed instead (remediation: run with torchax accuracy mode /
-        # jax_enable_x64, or reimplement the hash in 32-bit limbs).
+        # downcasts int64 to int32 and the ids would be corrupt. Enable x64
+        # here, before any PLE computation is traced (the flag only affects
+        # newly traced ops, and PLE construction happens before the runner
+        # compiles anything), so a plain server launch works out of the box.
+        # (Remediation alternative: reimplement the hash in 32-bit limbs.)
         if not jax.config.jax_enable_x64:
-            raise RuntimeError(
-                "Qwen4Exp PLE n-gram hashing requires 64-bit integer "
-                "arithmetic. Enable jax_enable_x64 (e.g. torchax."
-                "enable_accuracy_mode()) before loading the model, or "
-                "reimplement the hash in 32-bit limbs; with x64 disabled "
-                "the ids would be silently wrong.")
+            jax.config.update("jax_enable_x64", True)
+            logger.warning(
+                "Enabled jax_enable_x64 for Qwen4Exp PLE n-gram hashing "
+                "(int64 arithmetic is required; with x64 disabled the ids "
+                "would be silently wrong).")
 
         self.ngram_context_len = max(int(config.ngram_size) - 1, 0)
         # Ring capacities include the speculative slack so rejected draft
