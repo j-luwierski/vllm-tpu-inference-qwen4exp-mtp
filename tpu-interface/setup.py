@@ -94,7 +94,12 @@ setup(
     ],
     entry_points={
         "vllm.general_plugins": [
-            "register_layers = tpu_inference.layers.vllm:register_layers",
+            # Named after the distribution so `VLLM_PLUGINS=tpu_inference`
+            # (the documented way to select this plugin) matches the
+            # entry-point name; vLLM filters plugins by entry-point name,
+            # and the previous "register_layers" name was filtered out
+            # whenever VLLM_PLUGINS was set.
+            "tpu_inference = tpu_inference.layers.vllm:register_layers",
         ],
     },
 )
