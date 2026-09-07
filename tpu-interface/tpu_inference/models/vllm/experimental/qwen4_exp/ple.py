@@ -397,10 +397,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         stay TP-replicated, matching the TP-replicated kv_proj downstream.
         """
         ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
+        # Declare the callback output TP-replicated. Without this, the
+        # output lands with a GSPMDSharding{maximal device=0}, and eager
+        # jnp ops on it (torchax lowering) fail at
+        # "_to_sdy_sharding: Cannot convert GSPMDSharding into SdyArray"
+        # under jax 0.11. Replicated is both correct (ids are replicated)
+        # and convertible.
+        out_sharding = None
+        mesh = jax.sharding.get_mesh()
+        if mesh.size:
+            out_sharding = jax.sharding.NamedSharding(
+                mesh, jax.sharding.PartitionSpec())
         rows = jax.pure_callback(
             self._gather_rows_host,
             jax.ShapeDtypeStruct((ids_j.shape[0], self.head_dim),
-                                 jnp.bfloat16),
+                                 jnp.bfloat16,
+                                 sharding=out_sharding),
             ids_j,
         )
         # [T, heads, head_dim] flattened exactly like the reference's
