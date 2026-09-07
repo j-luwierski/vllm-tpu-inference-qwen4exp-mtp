@@ -25,6 +25,16 @@ _TPU_VLLM_MODELS = {
     "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpForCausalLM",
     "Qwen4ExpMTP":
     "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpMTP",
+    # The released checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) declares the
+    # multimodal-layout architecture "Qwen4ExpForConditionalGeneration"
+    # (vision_config + model.language_model.* weight prefixes). The TPU
+    # torchax port serves the text-only path of that checkpoint directly, so
+    # map the wrapper architecture name onto the text causal LM: its
+    # load_weights already strips the "model.language_model." prefix (see
+    # Qwen4ExpForCausalLM.hf_to_vllm_mapper). Without this, vLLM would fall
+    # back to the CUDA/ROCm-only wrapper class and refuse to run on TPU.
+    "Qwen4ExpForConditionalGeneration":
+    "tpu_inference.models.vllm.experimental.qwen4_exp:Qwen4ExpForCausalLM",
 }
 
 

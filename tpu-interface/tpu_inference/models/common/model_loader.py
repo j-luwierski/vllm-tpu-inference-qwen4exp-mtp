@@ -65,6 +65,12 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
     # directly instead of relying on the flax_nnx fallback.
     "Qwen4ExpForCausalLM",
     "Qwen4ExpMTP",
+    # The released Qwen3.8-Flash-Next checkpoint declares this multimodal-
+    # wrapper architecture name (registered above to the torchax text-only
+    # Qwen4ExpForCausalLM). resolve_model_architecture() switches impl type
+    # purely on this string, so it must be listed here too, otherwise
+    # MODEL_IMPL_TYPE=auto resolves to flax_nnx, which has no Qwen4Exp port.
+    "Qwen4ExpForConditionalGeneration",
 })
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
