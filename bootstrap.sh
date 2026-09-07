@@ -268,13 +268,21 @@ PYEOF
 log "bootstrap complete."
 log "server start command:"
 echo "  cd $WORK && PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \\"
+echo "    XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_USE_SHARDY_PARTITIONER=false \\"
 echo "    python3 -m vllm.entrypoints.openai.api_server \\"
 echo "    --model $MODEL_DIR --host 0.0.0.0 --port 8000 --tensor-parallel-size 8 \\"
-echo "    --safetensors-load-strategy lazy"
+echo "    --safetensors-load-strategy lazy --max-model-len 8192"
 # NOTE --safetensors-load-strategy lazy: the auto "prefetch" strategy pulls the
 # whole 172.78 GiB checkpoint into page cache while the weights themselves are
 # also resident during MoE requantization/sharding, which OOM-killed the
 # EngineCore (silent SIGKILL, no traceback) on the 377 GiB host.
+# NOTE XLA_PYTHON_CLIENT_PREALLOCATE=false: weights take ~15.3 GiB/chip after
+# the PLE host-offload; on-demand allocation leaves the remainder for KV cache.
+# NOTE JAX_USE_SHARDY_PARTITIONER=false: jax 0.11's Shardy pipeline cannot
+# lower eager/traced ops on pure_callback outputs (GSPMDSharding -> SdyArray
+# conversion failure) — the PLE host-gather callback requires the legacy
+# GSPMD path. --max-model-len 8192 caps the KV budget (~15.3 GiB/chip is
+# already taken by weights).
 
 # ---------------------------------------------------------------------------
 # 9. Optional: start the server in the background (same command as above).
@@ -283,10 +291,11 @@ if [ "$START_SERVER" = 1 ]; then
     log "starting API server in background (log: $WORK/server.log)"
     cd "$WORK"
     nohup env PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \
+        XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_USE_SHARDY_PARTITIONER=false \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_DIR" --host 0.0.0.0 --port 8000 \
         --tensor-parallel-size 8 --safetensors-load-strategy lazy \
-        > "$WORK/server.log" 2>&1 &
+        --max-model-len 8192 > "$WORK/server.log" 2>&1 &
     echo $! > "$WORK/server.pid"
     log "server pid $(cat "$WORK/server.pid"); follow with: tail -f $WORK/server.log"
 fi
