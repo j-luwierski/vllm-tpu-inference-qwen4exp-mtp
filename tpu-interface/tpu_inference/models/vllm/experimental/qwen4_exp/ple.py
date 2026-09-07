@@ -315,15 +315,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # (invisible to state_dict and to the runner's device_put), and the
         # forward gathers the rows it needs per step through
         # jax.pure_callback (see gather_host). Raw uint8 storage because
-        # numpy has no e4m3 dtype; the device reinterprets the bytes after
-        # the H2D copy. The bf16 (non-FP8) path stores ml_dtypes.bfloat16.
+        # numpy has no e4m3 dtype; the host stores raw bytes for the FP8
+        # table (uint8) and dequantizes rows to bf16 inside the gather
+        # callback. The bf16 (non-FP8) path stores ml_dtypes.bfloat16.
         if self.fp8:
             self._host_dtype = np.uint8
-            self._row_device_dtype = jnp.float8_e4m3fn
         else:
             import ml_dtypes
             self._host_dtype = np.dtype(ml_dtypes.bfloat16)
-            self._row_device_dtype = jnp.bfloat16
+        # Gathered rows are materialized as bf16 on the host: for the FP8
+        # table _gather_rows_host dequantizes (e4m3 -> f32 x scale -> bf16),
+        # so dequantize() short-circuits downstream.
+        self._host_dequant = self.fp8
+        self._host_scale = 1.0
         self.host_table = np.zeros((padded_vocab_size, self.head_dim),
                                    dtype=self._host_dtype)
         # NOTE: use register_parameter(name, None) rather than a plain
@@ -341,11 +345,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def _load_weight_scale(self, param: torch.Tensor,
                            loaded_weight: torch.Tensor) -> None:
         param.data.copy_(loaded_weight.reshape(param.shape).to(param.dtype))
+        # Host copy for the host-dequantized gather path.
+        self._host_scale = float(loaded_weight.reshape(-1)[0].item())
 
     def dequantize(self, embeddings: torch.Tensor,
                    output_dtype: torch.dtype) -> torch.Tensor:
-        if not self.fp8:
-            return embeddings
+        if not self.fp8 or self._host_dequant:
+            # Non-FP8 rows need no scale; host-offloaded FP8 rows were
+            # already dequantized (e4m3 -> f32 x global scale -> bf16) in
+            # _gather_rows_host. A .to(output_dtype) cast is all that can
+            # remain, and it is a no-op for the bf16 activation path.
+            return embeddings.to(output_dtype)
         if self.weight_scale is None:
             raise RuntimeError("FP8 PLE embedding is missing its scale")
         return embeddings.to(output_dtype) * self.weight_scale.to(
@@ -360,42 +370,39 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ids_np holds global row indices into the padded n-gram vocab
         (bounded by the per-head prime layouts, well inside int32).
         Fancy-indexing the host table copies exactly the requested rows.
+        For the FP8 table the rows are dequantized here (e4m3 -> f32 x
+        global scale -> bf16): the copy is a few MB, and doing it on the
+        host avoids a uint8->e4m3 bitcast on the device, which jax 0.11
+        cannot lower eagerly for callback outputs (GSPMDSharding -> Sdy
+        conversion failure).
         """
-        return self.host_table[ids_np]
+        rows = self.host_table[ids_np]
+        if self.fp8:
+            import ml_dtypes
+            rows = (rows.view(ml_dtypes.float8_e4m3fn).astype(np.float32) *
+                    self._host_scale).astype(ml_dtypes.bfloat16)
+        return rows
 
     def gather_host(self, ids_t: torch.Tensor) -> torch.Tensor:
-        """Gather rows for global ids from the host-resident table.
+        """Gather (and dequantize) rows for global ids from the host table.
 
         Replaces the on-device vocab-parallel embedding lookup. ids
         [..., ngram_heads] cross D2H (a few hundred KB), the row block
-        [..., head_dim] is gathered from host RAM and crosses H2D (a few
-        MB at the 2048-token prefill bucket). Runs as a jax.pure_callback
-        so it composes with the runner's jax.jit step function; the ids
-        are TP-replicated by construction (derived from the replicated
-        token stream and the TP-replicated PLE caches), so the callback
-        executes once per step and the rows stay TP-replicated, matching
-        the TP-replicated kv_proj downstream.
+        [..., head_dim] is gathered — and, for FP8, dequantized — on the
+        host and crosses H2D as bf16 (a few MB per 2048-token bucket).
+        Runs as a jax.pure_callback so it composes with the runner's
+        jax.jit step function; the ids are TP-replicated by construction
+        (derived from the replicated token stream and the TP-replicated
+        PLE caches), so the callback executes once per step and the rows
+        stay TP-replicated, matching the TP-replicated kv_proj downstream.
         """
         ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
-        # The ids are TP-replicated by construction (derived from the
-        # replicated token stream and the TP-replicated PLE caches), so the
-        # callback executes once per step with replicated data and the rows
-        # stay TP-replicated — matching the TP-replicated kv_proj. No
-        # explicit with_sharding_constraint: it would require a context mesh
-        # even in mesh-less (CPU unit test) contexts, and replication is
-        # already the default sharding these arrays trace with.
-        # The host function returns raw bytes (uint8) for the FP8 table —
-        # pure_callback validates the host-side dtype, so the e4m3
-        # reinterpretation happens on the device buffer after the H2D copy.
-        out_host_dtype = jnp.uint8 if self.fp8 else self._row_device_dtype
         rows = jax.pure_callback(
             self._gather_rows_host,
             jax.ShapeDtypeStruct((ids_j.shape[0], self.head_dim),
-                                 out_host_dtype),
+                                 jnp.bfloat16),
             ids_j,
         )
-        if self.fp8:
-            rows = rows.view(jnp.float8_e4m3fn)
         # [T, heads, head_dim] flattened exactly like the reference's
         # ngram_embedding(ngram_ids).reshape(num_tokens, -1).
         return torch_view(rows).reshape(ids_t.shape[0], -1)
