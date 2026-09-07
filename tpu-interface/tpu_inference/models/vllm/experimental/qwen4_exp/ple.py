@@ -315,11 +315,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
         )
-        self.weight_scale = None
+        # NOTE: use register_parameter(name, None) rather than a plain
+        # attribute assignment for the no-FP8 case; a plain `self.weight_scale
+        # = None` would put the name into __dict__, and torch's
+        # register_parameter then raises KeyError("attribute 'weight_scale'
+        # already exists") on the FP8 path.
         if self.fp8:
             scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
             scale.weight_loader = self._load_weight_scale
             self.register_parameter("weight_scale", scale)
+        else:
+            self.register_parameter("weight_scale", None)
 
     def _load_weight_scale(self, param: torch.Tensor,
                            loaded_weight: torch.Tensor) -> None:
