@@ -162,7 +162,10 @@ if [ "$NEED_VLLM_BUILD" = 1 ]; then
     rm -rf "$SP"/vllm-*.dist-info 2>/dev/null || true
     VLLM_TARGET_DEVICE=tpu pip install -q --no-build-isolation --no-deps \
         "$VLLM_LKG_DIR"
-    python3 -c "import vllm; assert 'g${VLLM_LKG_COMMIT:0:9}' in vllm.__version__, vllm.__version__" \
+    # Version check via dist metadata only: `import vllm` cannot work yet on
+    # a TPU box — the TPU platform class comes from the tpu_inference plugin,
+    # which is installed in the NEXT step.
+    python3 -c "import importlib.metadata as md; v = md.version('vllm'); assert 'g${VLLM_LKG_COMMIT:0:9}' in v, v" \
         || die "vLLM LKG build did not produce the expected version"
 fi
 
