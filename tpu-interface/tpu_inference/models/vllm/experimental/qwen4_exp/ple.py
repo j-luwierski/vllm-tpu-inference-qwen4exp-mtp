@@ -383,10 +383,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if jax.sharding.get_mesh().size:
             ids_j = jax.lax.with_sharding_constraint(
                 ids_j, jax.sharding.PartitionSpec())
+        # The host function returns raw bytes (uint8) for the FP8 table —
+        # pure_callback validates the host-side dtype, so the e4m3
+        # reinterpretation happens on the device buffer after the H2D copy.
+        out_host_dtype = jnp.uint8 if self.fp8 else self._row_device_dtype
         rows = jax.pure_callback(
             self._gather_rows_host,
             jax.ShapeDtypeStruct((ids_j.shape[0], self.head_dim),
-                                 self._row_device_dtype),
+                                 out_host_dtype),
             ids_j,
         )
         if self.fp8:
