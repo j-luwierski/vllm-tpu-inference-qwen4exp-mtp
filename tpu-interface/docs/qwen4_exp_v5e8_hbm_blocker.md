@@ -51,6 +51,36 @@ op), plus torchax/jax interop plumbing. This is a design-level change, not a
 patch. Alternatives (int4-quantizing the PLE table still leaves ~149 GiB on
 device; dropping PLE layers changes the model) do not close the gap.
 
+## Update 2026-09-07 (later): PLE host-offload implemented; requant transient is the last wall
+
+The host-offload is now implemented (`ple.py`): the table lives in host RAM
+as a plain numpy attribute, `gather_host()` fetches rows per step through
+`jax.pure_callback` (host-side e4m3 -> f32 x scale -> bf16 dequantization),
+and the load path fills the host table from the checkpoint shards. Verified
+by unit tests on CPU and on the 8-chip TPU mesh (jitted: exact match).
+
+With the table off device (~15.3 GiB/chip weights), the engine gets past
+weight streaming and MoE requantization now fails with a *visible* error
+instead of a silent kill:
+
+    _process_quantized_moe_weights_impl: RESOURCE_EXHAUSTED E0101
+    Error loading program 'jit__process_quantized_moe_weights_impl':
+    Attempting to reserve 420.19M ... There are 203.73M free.
+
+The 420 MB is the requant program's output allocation (split of merged
+w13 into w1/w3 + w2, per chip ~503 MB) coexisting with the pre-split
+weights already on device. Knobs tried: MOE_STAGE_WEIGHTS_ON_HOST=true and
+VLLM_INCREMENTAL_FP8_LOADING=true + --load-format tpu_streaming_loader
+(engaged, but the requant still ran after full placement).
+MOE_REQUANTIZE_BLOCK_SIZE cannot help: the reservation is the output
+tensors, not the block workspace.
+
+Remaining path to green on v5e-8: run the requant transform on the host
+(the staged inputs are already CPU tensors and, for this checkpoint, the
+transform is a split/scale re-index - no arithmetic when block boundaries
+match) so only the final tensors cross H2D; or repair the incremental
+trigger so per-layer processing runs before later layers are placed.
+
 ## What DOES work on v5e-8 (verified 2026-09-07)
 
 - full environment bootstrap (`bootstrap.sh`), TPU visibility (8 devices,
