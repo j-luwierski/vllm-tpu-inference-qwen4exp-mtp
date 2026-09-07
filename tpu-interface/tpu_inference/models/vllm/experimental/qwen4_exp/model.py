@@ -117,6 +117,32 @@ _QWEN4_EXP_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
 
 hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
 
+# Checkpoint prefixes that belong to parts of the released multimodal-layout
+# checkpoint the text-only TPU path does not instantiate:
+#   - "model.visual." / "visual.": the vision tower + deepstack projections
+#     (multimodal support is deferred on TPU);
+#   - "mtp." / "model.mtp.": the native MTP draft head, owned by
+#     Qwen4ExpMTP (loaded separately when speculative decoding is enabled).
+# Dropping them here keeps AutoWeightsLoader from raising on the wrapper's
+# extra tensors instead of erroring with "no module or parameter named
+# 'visual' in Qwen4ExpModel".
+_QWEN4_EXP_TEXT_ONLY_SKIPPED_PREFIXES = (
+    "model.visual.",
+    "visual.",
+    "mtp.",
+    "model.mtp.",
+)
+
+
+def _skip_non_text_weights(
+        weights: Iterable[Tuple[str,
+                                torch.Tensor]]) -> Iterable[Tuple[str,
+                                                                  torch.Tensor]]:
+    for name, tensor in weights:
+        if name.startswith(_QWEN4_EXP_TEXT_ONLY_SKIPPED_PREFIXES):
+            continue
+        yield name, tensor
+
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with the Qwen4Exp sequence-parallel restriction."""
@@ -451,4 +477,5 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.
             copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(_skip_non_text_weights(weights),
+                                   mapper=self.hf_to_vllm_mapper)
