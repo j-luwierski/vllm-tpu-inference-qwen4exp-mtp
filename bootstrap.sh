@@ -104,6 +104,7 @@ pip install -q --no-deps \
     loguru xprof py-cpuinfo pydantic-extra-types httpx2 apache-tvm-ffi \
     nixl google-cloud-storage pathwaysutils parameterized \
     runai-model-streamer gcsfs hypothesis sortedcontainers einshape \
+    model-hosting-container-standards \
     || die "runtime deps install failed"
 # These four are small and safe to resolve with deps (they pulled in
 # sniffio/httpx/anyio/jiter/mcp_types/jmespath in the session).
