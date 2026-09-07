@@ -377,12 +377,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         the TP-replicated kv_proj downstream.
         """
         ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
-        # Make the TP-replication explicit for the compiler when a mesh is
-        # active (the runner sets one); skip in bare-CPU / no-mesh contexts
-        # (unit tests), where the constraint would raise.
-        if jax.sharding.get_mesh().size:
-            ids_j = jax.lax.with_sharding_constraint(
-                ids_j, jax.sharding.PartitionSpec())
+        # The ids are TP-replicated by construction (derived from the
+        # replicated token stream and the TP-replicated PLE caches), so the
+        # callback executes once per step with replicated data and the rows
+        # stay TP-replicated — matching the TP-replicated kv_proj. No
+        # explicit with_sharding_constraint: it would require a context mesh
+        # even in mesh-less (CPU unit test) contexts, and replication is
+        # already the default sharding these arrays trace with.
         # The host function returns raw bytes (uint8) for the FP8 table —
         # pure_callback validates the host-side dtype, so the e4m3
         # reinterpretation happens on the device buffer after the H2D copy.
