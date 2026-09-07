@@ -269,7 +269,12 @@ log "bootstrap complete."
 log "server start command:"
 echo "  cd $WORK && PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \\"
 echo "    python3 -m vllm.entrypoints.openai.api_server \\"
-echo "    --model $MODEL_DIR --host 0.0.0.0 --port 8000 --tensor-parallel-size 8"
+echo "    --model $MODEL_DIR --host 0.0.0.0 --port 8000 --tensor-parallel-size 8 \\"
+echo "    --safetensors-load-strategy lazy"
+# NOTE --safetensors-load-strategy lazy: the auto "prefetch" strategy pulls the
+# whole 172.78 GiB checkpoint into page cache while the weights themselves are
+# also resident during MoE requantization/sharding, which OOM-killed the
+# EngineCore (silent SIGKILL, no traceback) on the 377 GiB host.
 
 # ---------------------------------------------------------------------------
 # 9. Optional: start the server in the background (same command as above).
@@ -280,7 +285,8 @@ if [ "$START_SERVER" = 1 ]; then
     nohup env PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_DIR" --host 0.0.0.0 --port 8000 \
-        --tensor-parallel-size 8 > "$WORK/server.log" 2>&1 &
+        --tensor-parallel-size 8 --safetensors-load-strategy lazy \
+        > "$WORK/server.log" 2>&1 &
     echo $! > "$WORK/server.pid"
     log "server pid $(cat "$WORK/server.pid"); follow with: tail -f $WORK/server.log"
 fi
