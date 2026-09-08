@@ -475,27 +475,12 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         p_w13_scale = getattr(layer, scale_w13_name)
         p_w2_scale = getattr(layer, scale_w2_name)
 
-        raw_tensors = (layer.w13_weight, layer.w2_weight, p_w13_scale,
-                       p_w2_scale)
-
-        # Free the raw weight parameters BEFORE requantization: with
-        # stage_on_host the host copies just built are the source of truth,
-        # and on capacity-limited chips the device cannot hold the raw
-        # inputs plus the requant program's outputs simultaneously. The
-        # layer params are re-created below from the processed weights.
-        delattr(layer, "w13_weight")
-        delattr(layer, "w2_weight")
-        delattr(layer, scale_w13_name)
-        delattr(layer, scale_w2_name)
-
-        input_weights = FusedMoEWeights(
-            w13_weight=w13_weight,
-            w13_weight_scale=w13_weight_scale,
-            w13_bias=None,
-            w2_weight=w2_weight,
-            w2_weight_scale=w2_weight_scale,
-            w2_bias=None,
-        )
+        raw = {
+            "w13_weight": layer.w13_weight,
+            "w2_weight": layer.w2_weight,
+            scale_w13_name: p_w13_scale,
+            scale_w2_name: p_w2_scale,
+        }
 
         weight_block_size = None
         if self.weight_block_size is not None:
@@ -503,23 +488,37 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
 
         chunk = envs.MOE_REQUANTIZE_EXPERT_CHUNK
         if chunk:
-            # Chunked requantization for capacity-limited devices: run the
-            # device program on slices of the local expert dim and stage each
-            # result back to host, so the device never holds the raw inputs
-            # and the full outputs at the same time. The final weights cross
-            # H2D once, at the end.
-            import jax
-            import numpy as np
-            E_local = input_weights.w13_weight.shape[0]
+            # Chunked requantization for capacity-limited devices (v5e-8):
+            # the staged device arrays hold every layer's raw expert weights,
+            # so a full-size requant program cannot allocate its outputs on
+            # top of them. Instead: free the staged arrays, then per chunk
+            # upload the raw CPU torch slice, run the requant program, and
+            # stage the result back to host. The final weights cross H2D
+            # once, after the loop, when the staged arrays are gone.
+            import ml_dtypes
+
+            del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
+
+            E_local = raw["w13_weight"].shape[0]
             host_chunks = []
             for e0 in range(0, E_local, chunk):
                 sl = slice(e0, e0 + chunk)
+
+                def _chunk_to_device(t: torch.Tensor) -> jax.Array:
+                    np_view = (t[sl].contiguous().view(torch.uint8).cpu()
+                               .numpy())
+                    if t.dtype == torch.float8_e4m3fn:
+                        np_view = np_view.view(ml_dtypes.float8_e4m3fn)
+                    else:
+                        np_view = np_view.view(ml_dtypes.bfloat16)
+                    return jax.device_put(np_view)
+
                 sub = FusedMoEWeights(
-                    w13_weight=input_weights.w13_weight[sl],
-                    w13_weight_scale=input_weights.w13_weight_scale[sl],
+                    w13_weight=_chunk_to_device(raw["w13_weight"]),
+                    w13_weight_scale=_chunk_to_device(raw[scale_w13_name]),
                     w13_bias=None,
-                    w2_weight=input_weights.w2_weight[sl],
-                    w2_weight_scale=input_weights.w2_weight_scale[sl],
+                    w2_weight=_chunk_to_device(raw["w2_weight"]),
+                    w2_weight_scale=_chunk_to_device(raw[scale_w2_name]),
                     w2_bias=None,
                 )
                 out = process_quantized_moe_weights(
@@ -530,6 +529,7 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     weight_block_size=weight_block_size,
                 )
                 host_chunks.append(jax.device_get(out))
+                del sub, out
             weights = FusedMoEWeights(
                 w13_weight=np.concatenate(
                     [c.w13_weight for c in host_chunks]),
@@ -541,7 +541,16 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     [c.w2_weight_scale for c in host_chunks]),
                 w2_bias=None,
             )
+            del raw
         else:
+            input_weights = FusedMoEWeights(
+                w13_weight=w13_weight,
+                w13_weight_scale=w13_weight_scale,
+                w13_bias=None,
+                w2_weight=w2_weight,
+                w2_weight_scale=w2_weight_scale,
+                w2_bias=None,
+            )
             weights = process_quantized_moe_weights(
                 input_weights,
                 moe_backend=self.moe_backend,
@@ -550,12 +559,11 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                 # Convert to tuple so jax jit can hash it
                 weight_block_size=weight_block_size,
             )
+            del input_weights
 
         # Free CPU memory now that weights have been safely transferred to TPU
-        for t in raw_tensors:
+        for t in raw.values():
             _free_torch_storage(t)
-
-        del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale, input_weights
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
