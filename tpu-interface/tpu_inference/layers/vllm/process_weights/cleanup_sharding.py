@@ -54,6 +54,16 @@ def shard_model_to_tpu(model: torch.nn.Module,
         torch.func.functional_call
     """
 
+    # Trim position-indexed rotary lookup tables to the served context
+    # length: the checkpoint carries a 1M-position cache (128 MiB per chip
+    # replicated) but only positions below max_model_len are addressed.
+    max_len = 4096
+    for module in model.modules():
+        cache = getattr(module, "cos_sin_cache", None)
+        if cache is not None and cache.dim() == 2 and cache.shape[0] > max_len:
+            module.cos_sin_cache = torch.nn.Parameter(
+                cache[:max_len].contiguous().clone(), requires_grad=False)
+
     with jax.default_device(jax.devices("cpu")[0]):
         _shard_module_to_tpu(model, mesh)
 

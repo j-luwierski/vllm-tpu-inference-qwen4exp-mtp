@@ -35,8 +35,9 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               ReplicatedLinear)
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 
 @dataclass
@@ -137,10 +138,16 @@ class GatedResidual(nn.Module):
         # the gate math (silu/sigmoid on the summed projection) is unchanged,
         # but the weights stop being replicated on every chip (~553 MiB/chip
         # saved at TP=8 for the 10240x320 and 320x10240 pair).
-        self.input_mix_weight_down = ColumnParallelLinear(
+        # Row-parallel over the hyper-hidden dim: each rank holds
+        # (hc_lowrank, hyper_hidden/tp) and the partial outputs are
+        # all-reduced inside the layer, so the gate math is unchanged while
+        # the weights shrink ~8x versus the replicated layout.
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.input_mix_weight_down = RowParallelLinear(
             self.hyper_hidden_size,
             config.hc_lowrank,
-            gather_output=True,
+            input_is_parallel=True,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
@@ -151,9 +158,10 @@ class GatedResidual(nn.Module):
         # Column-parallel sharding with the implicit all-reduce of the
         # partial outputs: the gate/residual math stays identical to the
         # replicated version while the weight shards to (1280, 320) per chip.
-        self.input_mix_weight_up = ColumnParallelLinear(
+        self.input_mix_weight_up = RowParallelLinear(
             config.hc_lowrank,
             self.hyper_hidden_size,
+            input_is_parallel=True,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
@@ -189,10 +197,20 @@ class GatedResidual(nn.Module):
         self, xn: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gated mean over the HC streams, plus this module's injection."""
+        # The row-parallel projections shard their INPUT dim, so slice the
+        # activations to this rank's span; the layer all-reduces its output.
+        hh_shard = self.hyper_hidden_size // self.tp_size
+        lr_shard = self.hc_lowrank // self.tp_size
+        xs = xn[..., self.tp_rank * hh_shard:(self.tp_rank + 1) * hh_shard]
         gate = torch.sigmoid(
             self.input_mix_weight_up(
-                torch.nn.functional.silu(self.input_mix_weight_down(xn) /
-                                         self.hc_count)))
+                torch.nn.functional.silu(self.input_mix_weight_down(xs) /
+                                         self.hc_count)[...,
+                                                        self.tp_rank *
+                                                        lr_shard:(self.
+                                                                  tp_rank +
+                                                                  1) *
+                                                        lr_shard]))
         block_input = (gate.unflatten(-1, (self.hc_count, self.hidden_size)) *
                        xn.unflatten(-1,
                                     (self.hc_count, self.hidden_size))).mean(
