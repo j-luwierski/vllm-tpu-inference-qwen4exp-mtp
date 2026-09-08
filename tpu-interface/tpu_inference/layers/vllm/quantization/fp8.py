@@ -530,6 +530,11 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                 )
                 host_chunks.append(jax.device_get(out))
                 del sub, out
+                try:
+                    fm = jax.devices()[0].memory_stats()["bytes_limit"] - jax.devices()[0].memory_stats()["bytes_in_use"]
+                    print(f"[CHUNKDBG] layer done e0={e0} free_hbm={fm/2**20:.0f}MiB", flush=True)
+                except Exception:
+                    pass
             weights = FusedMoEWeights(
                 w13_weight=np.concatenate(
                     [c.w13_weight for c in host_chunks]),
@@ -563,6 +568,11 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         # Free CPU memory now that weights have been safely transferred to TPU
         for t in raw.values():
             _free_torch_storage(t)
+        try:
+            st = jax.devices()[0].memory_stats()
+            print(f"[CHUNKDBG] pre-final-put free_hbm={(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB", flush=True)
+        except Exception:
+            pass
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
