@@ -450,34 +450,19 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         assert not self.moe.has_bias
 
         ep_sharding = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
-
-        # process_quantized_moe_weights below opens by putting each of these
-        # four at exactly `ep_sharding`, so building them there in the first
-        # place gives the same array without a full-size stop on one device.
         on_host = envs.MOE_STAGE_WEIGHTS_ON_HOST
-
-        w13_weight = _load_weight_for_layer(layer,
-                                            "w13_weight",
-                                            ep_sharding,
-                                            stage_on_host=on_host)
-        w2_weight = _load_weight_for_layer(layer,
-                                           "w2_weight",
-                                           ep_sharding,
-                                           stage_on_host=on_host)
 
         scale_w13_name = f"w13_{self.weight_scale_name}"
         scale_w2_name = f"w2_{self.weight_scale_name}"
-        w13_weight_scale = _load_weight_for_layer(layer,
-                                                  scale_w13_name,
-                                                  ep_sharding,
-                                                  stage_on_host=on_host)
-        w2_weight_scale = _load_weight_for_layer(layer,
-                                                 scale_w2_name,
-                                                 ep_sharding,
-                                                 stage_on_host=on_host)
-
         p_w13_scale = getattr(layer, scale_w13_name)
         p_w2_scale = getattr(layer, scale_w2_name)
+
+        # NOTE: the per-tensor staging (_load_weight_for_layer) happens only
+        # in the non-chunked path below. Its fallback (torchax t2j) lands the
+        # FULL unsharded weight on one device, which on capacity-limited
+        # chips (v5e-8) does not fit next to the resident layers. The chunked
+        # path reads the raw CPU parameters directly instead.
+        chunk = envs.MOE_REQUANTIZE_EXPERT_CHUNK
 
         raw = {
             "w13_weight": layer.w13_weight,
@@ -490,7 +475,6 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         if self.weight_block_size is not None:
             weight_block_size = tuple(self.weight_block_size)
 
-        chunk = envs.MOE_REQUANTIZE_EXPERT_CHUNK
         if chunk:
             # Chunked requantization for capacity-limited devices (v5e-8):
             # the staged device arrays hold every layer's raw expert weights,
@@ -600,6 +584,22 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             )
             del host_weights
         else:
+            w13_weight = _load_weight_for_layer(layer,
+                                                "w13_weight",
+                                                ep_sharding,
+                                                stage_on_host=on_host)
+            w2_weight = _load_weight_for_layer(layer,
+                                               "w2_weight",
+                                               ep_sharding,
+                                               stage_on_host=on_host)
+            w13_weight_scale = _load_weight_for_layer(layer,
+                                                      scale_w13_name,
+                                                      ep_sharding,
+                                                      stage_on_host=on_host)
+            w2_weight_scale = _load_weight_for_layer(layer,
+                                                     scale_w2_name,
+                                                     ep_sharding,
+                                                     stage_on_host=on_host)
             input_weights = FusedMoEWeights(
                 w13_weight=w13_weight,
                 w13_weight_scale=w13_weight_scale,
