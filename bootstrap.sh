@@ -272,7 +272,8 @@ echo "    XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_USE_SHARDY_PARTITIONER=false \
     MOE_REQUANTIZE_EXPERT_CHUNK=8 \\"
 echo "    python3 -m vllm.entrypoints.openai.api_server \\"
 echo "    --model $MODEL_DIR --host 0.0.0.0 --port 8000 --tensor-parallel-size 8 \\"
-echo "    --safetensors-load-strategy lazy --max-model-len 8192"
+echo "    --safetensors-load-strategy lazy --max-model-len 8192 \\
+    --max-num-batch-prefill-tokens 1024 --max-num-seqs 4"
 # NOTE --safetensors-load-strategy lazy: the auto "prefetch" strategy pulls the
 # whole 172.78 GiB checkpoint into page cache while the weights themselves are
 # also resident during MoE requantization/sharding, which OOM-killed the
@@ -297,7 +298,8 @@ if [ "$START_SERVER" = 1 ]; then
         python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_DIR" --host 0.0.0.0 --port 8000 \
         --tensor-parallel-size 8 --safetensors-load-strategy lazy \
-        --max-model-len 8192 > "$WORK/server.log" 2>&1 &
+        --max-model-len 8192 --max-num-batch-prefill-tokens 1024 \
+        --max-num-seqs 4 > "$WORK/server.log" 2>&1 &
     echo $! > "$WORK/server.pid"
     log "server pid $(cat "$WORK/server.pid"); follow with: tail -f $WORK/server.log"
 fi
