@@ -312,6 +312,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) else None,
+    # Override the w13 GMM reorder size (defaults to the MLP tensor-parallel
+    # size). The reorder groups experts to avoid collectives but pads each
+    # group's intermediate dim to 128 — on v5e-8 with 512 experts x 640
+    # intermediate that padding bloats the processed experts by ~60% and
+    # pushes them past the 16 GiB HBM. Set 1 to skip the grouping entirely
+    # (no padding: the processed experts keep their raw checkpoint size).
+    "MOE_W13_REORDER_SIZE":
+    lambda: int(rs) if (rs := os.getenv("MOE_W13_REORDER_SIZE")) else 0,
     # Process MoE requantization in chunks of this many local experts, with
     # each chunk's result staged to host. 0 = process all local experts in
     # one program (default). Set on capacity-limited devices (e.g. v5e-8)

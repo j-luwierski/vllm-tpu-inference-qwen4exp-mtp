@@ -1086,8 +1086,8 @@ def _process_quantized_moe_weights_impl(
 
     w13_interleave = (activation == "swigluoai"
                       or activation == MoEActivation.SWIGLUOAI)
-    w13_reorder_size = get_mesh_shape_product(mesh,
-                                              ShardingAxisName.MLP_TENSOR)
+    w13_reorder_size = envs.MOE_W13_REORDER_SIZE or get_mesh_shape_product(
+        mesh, ShardingAxisName.MLP_TENSOR)
 
     if disable_weight_requantization:
         return _process_moe_weights_no_requant(
@@ -1273,8 +1273,8 @@ def process_unquantized_moe_weights(
         )
 
     w13_interleave = activation == MoEActivation.SWIGLUOAI
-    w13_reorder_size = get_mesh_shape_product(mesh,
-                                              ShardingAxisName.MLP_TENSOR)
+    w13_reorder_size = envs.MOE_W13_REORDER_SIZE or get_mesh_shape_product(
+        mesh, ShardingAxisName.MLP_TENSOR)
 
     return process_moe_weights(
         weights,
