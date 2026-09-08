@@ -81,6 +81,35 @@ transform is a split/scale re-index - no arithmetic when block boundaries
 match) so only the final tensors cross H2D; or repair the incremental
 trigger so per-layer processing runs before later layers are placed.
 
+## Update 2026-09-08: requantization now runs; the final wall is arithmetic
+
+With MOE_STAGE_WEIGHTS_ON_HOST + VLLM_INCREMENTAL_FP8_LOADING +
+--load-format tpu_streaming_loader (per-layer triggers), plus two new forks
+patches — MOE_REQUANTIZE_EXPERT_CHUNK (chunked requant with host staging;
+the full-size program's 420M output allocation fails against the staged
+weights) and MOE_W13_REORDER_SIZE=1 (the GMM expert grouping pads each
+chunk's intermediate 80 -> 128, bloating processed experts by ~60%:
+processed 320/160 MiB per chip per layer vs raw 210/105) — the engine
+requantizes and places layer after layer. Measured free HBM decays
+~430 MiB per layer from 13.1 GiB and the run dies at layer ~30 of 48.
+
+The remaining gap is arithmetic, not engineering: experts 14.36 GiB/chip
+(fp8, raw) + non-expert weights 1.27 GiB/chip + jax/runtime overhead
+~1.3 GiB/chip (measured: only 13.1 GiB free before the first MoE layer)
+= ~16.9 GiB vs 16 GiB HBM. Even with zero leaks and no kernel-layout
+overhead the weights alone (15.63 GiB/chip) leave ~0.37 GiB/chip, which
+the runtime overhead alone exceeds. v5e-8 cannot serve this checkpoint at
+FP8 with the PLE host-offload alone; it needs ~2 GiB/chip more offload
+(e.g. 4-bit MoE at checkpoint level, embedding/lm_head offload+fp8, or a
+streamed-expert kernel) or a larger pod.
+
+Fixes landed in the fork (all behind env flags, defaults unchanged):
+chunked requantization with host staging (MOE_REQUANTIZE_EXPERT_CHUNK),
+w13 reorder-size override (MOE_W13_REORDER_SIZE), raw-parameter release
+before the per-layer final H2D, and the incremental per-layer trigger
+verified working (it fires per layer; the earlier 6-vs-4/expert theory
+was wrong — arrivals are 6/expert even for fused-w13 checkpoints).
+
 ## What DOES work on v5e-8 (verified 2026-09-07)
 
 - full environment bootstrap (`bootstrap.sh`), TPU visibility (8 devices,
