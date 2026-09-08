@@ -91,6 +91,13 @@ def shard_model_to_tpu(model: torch.nn.Module,
                             sharding = NamedSharding(mesh, P("model", None))
                         return torch_view(
                             general_device_put(np_view, sharding))
+            if _tensor_is_in_cpu(_p) and _p.numel() * _p.element_size(
+            ) > 100 * 2**20:
+                st = jax.devices()[0].memory_stats()
+                print(f"[CLNDBG3] {_name} shape={tuple(_p.shape)} "
+                      f"dtype={_p.dtype} free_before="
+                      f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+                      flush=True)
             return _shard_tensor_to_tpu_replicated(_p, mesh)
 
         for _name, _p in list(params.items()):
