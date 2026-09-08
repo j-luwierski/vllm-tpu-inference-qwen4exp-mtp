@@ -110,6 +110,33 @@ before the per-layer final H2D, and the incremental per-layer trigger
 verified working (it fires per layer; the earlier 6-vs-4/expert theory
 was wrong — arrivals are 6/expert even for fused-w13 checkpoints).
 
+## Update 2026-09-08 (evening): the engine now loads and requantizes ALL 48 layers
+
+Chain of fixes (all env-gated, defaults preserved):
+- chunked requantization (MOE_REQUANTIZE_EXPERT_CHUNK=8) with per-chunk
+  host staging and per-device shard placement
+  (make_array_from_single_device_arrays — no full-size staging);
+- explicit fp8 requant target (the streamed FusedMoE params are bf16, so
+  the dtype-derived target kept the processed weights in bf16 — 2x size);
+- MOE_W13_REORDER_SIZE=1 (the GMM grouping padded the intermediate
+  80 -> 128 per chunk: +60% on the processed experts);
+- hyper-connection projections row/column-parallel instead of replicated
+  (1.9 GiB/chip -> ~75 MiB/chip across 48 layers);
+- rotary cos_sin_cache trimmed to the served context (128 MiB/chip -> 2);
+- token embedding table host-offloaded (QWEN4_EXP_HOST_EMBEDDING,
+  ~149 MiB/chip), mirroring the PLE table offload;
+- gc.collect() per processed layer (cyclic transients ~300 MiB/layer).
+
+Result: all 48 MoE layers requantize and place; the engine reaches the
+final shard_model_to_tpu cleanup with ~0.6-0.8 GiB/chip free. The
+remaining failure: ONE (512, 1280, 2560) fp8 raw w13 CPU tensor still
+reaches the generic replication walk, and its t2j (1.56 GiB on one device)
+OOMs. The layer it belongs to is not yet identified (CLNDBG3 name logging
+added; the safety net that re-processes CPU RoutedExperts layers did not
+fire, so the holder is either a non-RoutedExperts module or a param the
+walk sees that the safety net does not). Next step: read the CLNDBG3 name
+from the next boot and route that holder through the chunked requant too.
+
 ## What DOES work on v5e-8 (verified 2026-09-07)
 
 - full environment bootstrap (`bootstrap.sh`), TPU visibility (8 devices,
