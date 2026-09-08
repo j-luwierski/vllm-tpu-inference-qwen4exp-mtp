@@ -260,6 +260,19 @@ MODULE_TYPE_TO_SHARDING_FUNC = [
 
 def _shard_module_to_tpu(model: torch.nn.Module, mesh: Mesh) -> None:
     for path, module in model.named_modules():
+        # Safety net: any MoE layer whose streamed weights are still on CPU
+        # (its incremental trigger missed) must be requantized and placed
+        # before the generic replication walk touches its raw fp8 tensor —
+        # a full-size t2j of it cannot fit on capacity-limited chips.
+        if type(module).__name__ == "RoutedExperts":
+            w13 = getattr(module, "w13_weight", None)
+            if w13 is not None and _tensor_is_in_cpu(w13):
+                logger.warning(
+                    "MoE layer %s still has CPU weights at sharding time; "
+                    "processing it now", path)
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    quant_method.process_weights_after_loading(module)
         _replicate_fused_moe_hash_indices_tables_and_e_score_correction_bias(
             module, mesh)
         for module_type, sharding_func in MODULE_TYPE_TO_SHARDING_FUNC:
