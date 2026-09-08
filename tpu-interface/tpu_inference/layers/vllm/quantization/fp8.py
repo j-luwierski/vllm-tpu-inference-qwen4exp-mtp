@@ -502,6 +502,10 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             import ml_dtypes
 
             del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
+            st = jax.devices()[0].memory_stats()
+            print(f"[CHUNKDBG] staged-freed free="
+                  f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+                  flush=True)
 
             E_local = raw["w13_weight"].shape[0]
             host_chunks = []
@@ -539,13 +543,13 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     desired_quant_dtype=jnp.float8_e4m3fn,
                 )
                 host_chunks.append(jax.device_get(out))
-                if e0 == 0:
-                    st = jax.devices()[0].memory_stats()
-                    print(f"[CHUNKDBG] out w13 {out.w13_weight.dtype} "
-                          f"{tuple(out.w13_weight.shape)} free="
-                          f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
-                          flush=True)
                 del sub, out
+                st = jax.devices()[0].memory_stats()
+                print(f"[CHUNKDBG] e0={e0} out w13 {out.w13_weight.dtype} "
+                      f"{tuple(out.w13_weight.shape)} w2 "
+                      f"{tuple(out.w2_weight.shape)} free="
+                      f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+                      flush=True)
                 try:
                     fm = jax.devices()[0].memory_stats()["bytes_limit"] - jax.devices()[0].memory_stats()["bytes_in_use"]
                     print(f"[CHUNKDBG] layer done e0={e0} free_hbm={fm/2**20:.0f}MiB", flush=True)
@@ -600,6 +604,11 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
+        st = jax.devices()[0].memory_stats()
+        print(f"[CHUNKDBG] post-final-put free="
+              f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB "
+              f"w13 {weights.w13_weight.dtype} "
+              f"{tuple(weights.w13_weight.shape)}", flush=True)
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
