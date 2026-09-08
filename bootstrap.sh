@@ -270,7 +270,7 @@ log "server start command:"
 echo "  cd $WORK && PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \\"
 echo "    XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_USE_SHARDY_PARTITIONER=false \\
     MOE_REQUANTIZE_EXPERT_CHUNK=8 MOE_W13_REORDER_SIZE=1 \\
-    QWEN4_EXP_HOST_EMBEDDING=true \\"
+    QWEN4_EXP_HOST_EMBEDDING=true SKIP_JAX_PRECOMPILE=true \\"
 echo "    python3 -m vllm.entrypoints.openai.api_server \\"
 echo "    --model $MODEL_DIR --host 0.0.0.0 --port 8000 --tensor-parallel-size 8 \\"
 echo "    --safetensors-load-strategy lazy --max-model-len 8192 \\
@@ -296,7 +296,7 @@ if [ "$START_SERVER" = 1 ]; then
     nohup env PJRT_DEVICE=TPU VLLM_PLUGINS=tpu_inference \
         XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_USE_SHARDY_PARTITIONER=false \
         MOE_REQUANTIZE_EXPERT_CHUNK=8 MOE_W13_REORDER_SIZE=1 \
-        QWEN4_EXP_HOST_EMBEDDING=true \
+        QWEN4_EXP_HOST_EMBEDDING=true SKIP_JAX_PRECOMPILE=true \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_DIR" --host 0.0.0.0 --port 8000 \
         --tensor-parallel-size 8 --safetensors-load-strategy lazy \
