@@ -442,6 +442,10 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         if not hasattr(layer, "w13_weight") or not _tensor_is_in_cpu(
                 layer.w13_weight):
             return
+        st = jax.devices()[0].memory_stats()
+        print(f"[CHUNKDBG] PROCESS ENTRY free="
+              f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB "
+              f"in_use={st['bytes_in_use']/2**20:.0f}MiB", flush=True)
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias
 
@@ -527,8 +531,20 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     mesh=self.mesh,
                     activation=layer.activation.value,
                     weight_block_size=weight_block_size,
+                    # The streamed FusedMoE parameters are created in the
+                    # model dtype (bf16), so the dtype-derived default target
+                    # would keep the processed weights in bf16 — twice the
+                    # checkpoint size. The checkpoint is fp8; requantize to
+                    # fp8 explicitly.
+                    desired_quant_dtype=jnp.float8_e4m3fn,
                 )
                 host_chunks.append(jax.device_get(out))
+                if e0 == 0:
+                    st = jax.devices()[0].memory_stats()
+                    print(f"[CHUNKDBG] out w13 {out.w13_weight.dtype} "
+                          f"{tuple(out.w13_weight.shape)} free="
+                          f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+                          flush=True)
                 del sub, out
                 try:
                     fm = jax.devices()[0].memory_stats()["bytes_limit"] - jax.devices()[0].memory_stats()["bytes_in_use"]
