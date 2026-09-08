@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import jax
+import numpy as np
 import torch
 import torchax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
