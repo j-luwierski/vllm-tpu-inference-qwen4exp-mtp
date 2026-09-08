@@ -197,6 +197,11 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
         from tpu_inference.layers.vllm.quantization.unquantized import (
             _host_numpy_view)
         np_view = _host_numpy_view(tensor)
+        if np_view is None:
+            # _host_numpy_view declines non-contiguous tensors; make a
+            # contiguous host copy and retry instead of t2j, which lands the
+            # full tensor on one device (OOM on v5e-8).
+            np_view = _host_numpy_view(tensor.detach().contiguous().cpu())
         if np_view is not None:
             return torch_view(general_device_put(np_view, sharding))
         tensor = t2j(tensor)
