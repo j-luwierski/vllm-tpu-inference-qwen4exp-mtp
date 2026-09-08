@@ -79,6 +79,14 @@ def shard_model_to_tpu(model: torch.nn.Module,
             _host_numpy_view)
 
         def _shard_named(_name: str, _p: torch.Tensor) -> torch.Tensor:
+            # The chunked requant already placed every MoE layer's weights on
+            # the device (expert-sharded). Re-shard them here and the generic
+            # replication walk would copy the full 1.56 GiB w13 onto one
+            # device per layer, exhausting HBM.
+            if "mlp.experts." in _name and (
+                    "w13_weight" in _name or "w2_weight" in _name
+                    or "weight_scale_inv" in _name):
+                return _p
             if _tensor_is_in_cpu(_p) and _p.dim() == 2 and (
                     "input_mix_weight_down" in _name
                     or "input_mix_weight_up" in _name):
