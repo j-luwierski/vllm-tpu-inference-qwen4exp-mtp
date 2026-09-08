@@ -109,6 +109,12 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
             np_tensor = tensor.detach().cpu().to(torch.float32).numpy()
             return torch_view(
                 jax.device_put(np_tensor, sharding).astype(dtype))
+    if tensor.numel() * tensor.element_size() > 4 * 2**20:
+        st = jax.devices()[0].memory_stats()
+        print(f"[CLNDBG] {getattr(tensor, 'param_name', '?')} shape="
+              f"{tuple(tensor.shape)} dtype={tensor.dtype} "
+              f"free_before={(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+              flush=True)
     if isinstance(tensor, torchax.tensor.Tensor):
         tensor = jax_view(tensor)
     else:
