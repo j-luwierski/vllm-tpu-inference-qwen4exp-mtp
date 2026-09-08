@@ -87,18 +87,20 @@ def shard_model_to_tpu(model: torch.nn.Module,
                     "w13_weight" in _name or "w2_weight" in _name
                     or "weight_scale_inv" in _name):
                 return _p
-            if _tensor_is_in_cpu(_p) and _p.dim() == 2 and (
-                    "input_mix_weight_down" in _name
-                    or "input_mix_weight_up" in _name):
+            # Large CPU 2-D weights: shard along the larger dim instead of
+            # replicating. The full-replica layout of the non-MoE linears
+            # costs ~6 GiB per chip on v5e-8 and does not fit; jax inserts
+            # the all-reduces the matmuls need automatically.
+            if _tensor_is_in_cpu(_p) and _p.dim() == 2 and _p.numel(
+            ) * _p.element_size() > 8 * 2**20:
                 np_view = _host_numpy_view(_p)
                 if np_view is not None:
-                    if _p.shape[0] * _p.shape[1] == 320 * 10240:
-                        if _p.shape[0] == 320:  # down: shard the input dim
-                            sharding = NamedSharding(mesh, P(None, "model"))
-                        else:  # up: shard the output dim
-                            sharding = NamedSharding(mesh, P("model", None))
-                        return torch_view(
-                            general_device_put(np_view, sharding))
+                    if _p.shape[0] >= _p.shape[1]:
+                        sharding = NamedSharding(mesh, P("model", None))
+                    else:
+                        sharding = NamedSharding(mesh, P(None, "model"))
+                    return torch_view(
+                        general_device_put(np_view, sharding))
             if _tensor_is_in_cpu(_p) and _p.numel() * _p.element_size(
             ) > 100 * 2**20:
                 st = jax.devices()[0].memory_stats()
