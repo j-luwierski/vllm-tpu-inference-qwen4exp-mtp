@@ -605,9 +605,16 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
         st = jax.devices()[0].memory_stats()
-        print(f"[CHUNKDBG] post-final-put free="
-              f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB "
-              f"w13 {weights.w13_weight.dtype} "
+        free0 = (st['bytes_limit'] - st['bytes_in_use']) / 2**20
+        # The processing path builds dataclass/torchax wrapper graphs that
+        # end up in reference cycles; without a collection the device
+        # buffers of the transient copies are reclaimed only eventually,
+        # which on a capacity-limited chip looks like a per-layer leak.
+        gc.collect()
+        st = jax.devices()[0].memory_stats()
+        free1 = (st['bytes_limit'] - st['bytes_in_use']) / 2**20
+        print(f"[CHUNKDBG] post-final-put free={free0:.0f}MiB "
+              f"after-gc={free1:.0f}MiB w13 {weights.w13_weight.dtype} "
               f"{tuple(weights.w13_weight.shape)}", flush=True)
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
