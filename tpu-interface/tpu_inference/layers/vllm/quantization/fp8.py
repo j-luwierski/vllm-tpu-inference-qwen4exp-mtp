@@ -485,12 +485,6 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             # once, after the loop, when the staged arrays are gone.
             import ml_dtypes
 
-            del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
-            st = jax.devices()[0].memory_stats()
-            print(f"[CHUNKDBG] staged-freed free="
-                  f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
-                  flush=True)
-
             E_local = raw["w13_weight"].shape[0]
             host_chunks = []
             for e0 in range(0, E_local, chunk):
