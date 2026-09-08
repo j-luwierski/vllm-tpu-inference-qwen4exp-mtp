@@ -112,6 +112,16 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
     if isinstance(tensor, torchax.tensor.Tensor):
         tensor = jax_view(tensor)
     else:
+        # Stage straight from the host bytes: torchax's t2j widens bf16/fp8
+        # to float32 first, and those full-size fp32 transients do not fit
+        # alongside the resident weights on capacity-limited chips (v5e-8).
+        # A zero-copy host numpy view + a direct sharded device_put skips the
+        # widening entirely.
+        from tpu_inference.layers.vllm.quantization.unquantized import (
+            _host_numpy_view)
+        np_view = _host_numpy_view(tensor)
+        if np_view is not None:
+            return torch_view(general_device_put(np_view, sharding))
         tensor = t2j(tensor)
     return torch_view(general_device_put(tensor, sharding))
 
