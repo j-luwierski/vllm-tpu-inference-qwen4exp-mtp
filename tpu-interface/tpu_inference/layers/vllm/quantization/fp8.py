@@ -555,7 +555,13 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     print(f"[CHUNKDBG] layer done e0={e0} free_hbm={fm/2**20:.0f}MiB", flush=True)
                 except Exception:
                     pass
-            weights = FusedMoEWeights(
+            # Assemble the processed weights straight into their final
+            # sharded device buffers: make_array_from_callback allocates each
+            # shard exactly once and fills it from the host chunks. A Format
+            # device_put of the assembled global array instead stages a
+            # full-size transient on one device, which on v5e-8 accumulates
+            # per layer until HBM is exhausted.
+            host_weights = FusedMoEWeights(
                 w13_weight=np.concatenate(
                     [c.w13_weight for c in host_chunks]),
                 w13_weight_scale=np.concatenate(
@@ -566,6 +572,21 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     [c.w2_weight_scale for c in host_chunks]),
                 w2_bias=None,
             )
+            ep = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
+
+            def _make(host_np: np.ndarray) -> jax.Array:
+                return jax.make_array_from_callback(host_np.shape, ep,
+                                                    lambda idx: host_np[idx])
+
+            weights = FusedMoEWeights(
+                w13_weight=_make(host_weights.w13_weight),
+                w13_weight_scale=_make(host_weights.w13_weight_scale),
+                w13_bias=None,
+                w2_weight=_make(host_weights.w2_weight),
+                w2_weight_scale=_make(host_weights.w2_weight_scale),
+                w2_bias=None,
+            )
+            del host_weights
         else:
             input_weights = FusedMoEWeights(
                 w13_weight=w13_weight,
@@ -602,8 +623,14 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         except Exception:
             pass
 
-        weights = torch_view(
-            shard_moe_weights(weights, self.moe_backend, self.mesh))
+        if chunk:
+            # The chunked path already produced arrays at their final
+            # sharding (make_array_from_callback); resharding again would
+            # only stage another full-size transient.
+            weights = torch_view(weights)
+        else:
+            weights = torch_view(
+                shard_moe_weights(weights, self.moe_backend, self.mesh))
         st = jax.devices()[0].memory_stats()
         free0 = (st['bytes_limit'] - st['bytes_in_use']) / 2**20
         # The processing path builds dataclass/torchax wrapper graphs that
