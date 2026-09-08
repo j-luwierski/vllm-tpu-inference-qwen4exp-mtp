@@ -35,7 +35,9 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
 
 
 @dataclass
@@ -132,9 +134,14 @@ class GatedResidual(nn.Module):
 
         # quant_config=None: the HC glue is kept in checkpoint bf16/fp32 on
         # purpose; the NVIDIA reference also builds these unquantized.
-        self.input_mix_weight_down = ReplicatedLinear(
+        # Column-parallel over the hyper-hidden dim with the output gathered:
+        # the gate math (silu/sigmoid on the summed projection) is unchanged,
+        # but the weights stop being replicated on every chip (~553 MiB/chip
+        # saved at TP=8 for the 10240x320 and 320x10240 pair).
+        self.input_mix_weight_down = ColumnParallelLinear(
             self.hyper_hidden_size,
             config.hc_lowrank,
+            gather_output=True,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
@@ -142,9 +149,10 @@ class GatedResidual(nn.Module):
             "input_mix_weight_down",
             return_bias=False,
         )
-        self.input_mix_weight_up = ReplicatedLinear(
+        self.input_mix_weight_up = RowParallelLinear(
             config.hc_lowrank,
             self.hyper_hidden_size,
+            input_is_parallel=False,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
