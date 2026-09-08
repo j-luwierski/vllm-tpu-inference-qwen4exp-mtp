@@ -95,12 +95,32 @@ def shard_model_to_tpu(model: torch.nn.Module,
             ) * _p.element_size() > 2 * 2**20:
                 np_view = _host_numpy_view(_p)
                 if np_view is not None:
+                    # Place each shard straight onto its device: a sharded
+                    # device_put of the global host array stages the full
+                    # tensor on one device first (the detour), which on
+                    # v5e-8 does not fit next to the resident layers.
                     if _p.shape[0] >= _p.shape[1]:
                         sharding = NamedSharding(mesh, P("model", None))
                     else:
                         sharding = NamedSharding(mesh, P(None, "model"))
+                    devices = list(mesh.devices.flat)
+                    n = len(devices)
+                    shard_shape = (_p.shape[0], _p.shape[1] // n
+                                   ) if _p.shape[0] < _p.shape[1] else (
+                                       _p.shape[0] // n, _p.shape[1])
+                    pieces = []
+                    for d, dev in enumerate(devices):
+                        if _p.shape[0] >= _p.shape[1]:
+                            piece = np_view[d * shard_shape[0]:(
+                                d + 1) * shard_shape[0]]
+                        else:
+                            piece = np_view[:, d * shard_shape[1]:(d + 1) *
+                                            shard_shape[1]]
+                        pieces.append(
+                            jax.device_put(np.ascontiguousarray(piece), dev))
                     return torch_view(
-                        general_device_put(np_view, sharding))
+                        jax.make_array_from_single_device_arrays(
+                            _p.shape, sharding, pieces))
             if _tensor_is_in_cpu(_p) and _p.numel() * _p.element_size(
             ) > 100 * 2**20:
                 st = jax.devices()[0].memory_stats()
