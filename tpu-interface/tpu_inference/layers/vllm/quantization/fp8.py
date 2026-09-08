@@ -541,7 +541,6 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
                     [c.w2_weight_scale for c in host_chunks]),
                 w2_bias=None,
             )
-            del raw
         else:
             input_weights = FusedMoEWeights(
                 w13_weight=w13_weight,
