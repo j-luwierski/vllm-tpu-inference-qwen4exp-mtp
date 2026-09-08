@@ -92,7 +92,7 @@ def shard_model_to_tpu(model: torch.nn.Module,
             # costs ~6 GiB per chip on v5e-8 and does not fit; jax inserts
             # the all-reduces the matmuls need automatically.
             if _tensor_is_in_cpu(_p) and _p.dim() == 2 and _p.numel(
-            ) * _p.element_size() > 8 * 2**20:
+            ) * _p.element_size() > 2 * 2**20:
                 np_view = _host_numpy_view(_p)
                 if np_view is not None:
                     if _p.shape[0] >= _p.shape[1]:
