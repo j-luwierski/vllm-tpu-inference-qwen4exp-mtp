@@ -575,8 +575,20 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             ep = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
 
             def _make(host_np: np.ndarray) -> jax.Array:
-                return jax.make_array_from_callback(host_np.shape, ep,
-                                                    lambda idx: host_np[idx])
+                # Put each expert shard straight onto its device and assemble
+                # the sharded array from the single-device buffers. A sharded
+                # device_put of the global host array instead stages the full
+                # 1.56 GiB on one device first (the 'detour'), which does not
+                # fit once 47 layers are already resident.
+                n_devices = len(self.mesh.devices.flat)
+                step = host_np.shape[0] // n_devices
+                pieces = []
+                for d, dev in enumerate(self.mesh.devices.flat):
+                    piece = np.ascontiguousarray(
+                        host_np[d * step:(d + 1) * step])
+                    pieces.append(jax.device_put(piece, jax.devices()[d]))
+                return jax.make_array_from_single_device_arrays(
+                    host_np.shape, ep, pieces)
 
             weights = FusedMoEWeights(
                 w13_weight=_make(host_weights.w13_weight),
