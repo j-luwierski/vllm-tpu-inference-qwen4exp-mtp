@@ -312,6 +312,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) else None,
+    # Keep the token embedding table in host RAM (rows fetched per step via
+    # jax.pure_callback, mirroring the PLE table offload). Frees ~149 MiB
+    # per chip on capacity-limited pods (v5e-8).
+    "QWEN4_EXP_HOST_EMBEDDING":
+    lambda: os.getenv("QWEN4_EXP_HOST_EMBEDDING", "false").lower() in
+    ("1", "true", "yes"),
     # Override the w13 GMM reorder size (defaults to the MLP tensor-parallel
     # size). The reorder groups experts to avoid collectives but pads each
     # group's intermediate dim to 128 — on v5e-8 with 512 experts x 640

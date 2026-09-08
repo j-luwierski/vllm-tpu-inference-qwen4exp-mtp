@@ -49,8 +49,12 @@ from collections.abc import Iterable
 from itertools import islice
 from typing import Optional, Tuple, Union
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import torch
 from torch import nn
+from torchax.interop import jax_view, torch_view
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -73,6 +77,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
+from tpu_inference import envs
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.experimental.qwen4_exp.hyper_connection import \
     GatedResidual
@@ -308,6 +313,53 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return hidden_states, mlp_out, injection
 
 
+class Qwen4ExpHostEmbedding(nn.Module):
+    """Host-resident token embedding for capacity-limited TPU pods.
+
+    Mirrors the PLE n-gram table offload: the [vocab, hidden] bf16 table is
+    a plain numpy attribute (never a device parameter, invisible to
+    state_dict and to the runner's device_put), rows are gathered per step
+    through jax.pure_callback, and load_weights writes the streamed
+    checkpoint rows into the host table. Frees ~149 MiB/chip on v5e-8.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int,
+                 prefix: str = "") -> None:
+        super().__init__()
+        import ml_dtypes
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.prefix = prefix
+        self._host_dtype = np.dtype(ml_dtypes.bfloat16)
+        self.host_table = np.zeros((vocab_size, hidden_size),
+                                   dtype=self._host_dtype)
+
+    def _gather_rows_host(self, ids_np: np.ndarray) -> np.ndarray:
+        return self.host_table[ids_np]
+
+    def forward(self, ids_t: torch.Tensor) -> torch.Tensor:
+        ids_j = jax_view(ids_t).reshape(-1).astype(jnp.int32)
+        rows = jax.pure_callback(
+            self._gather_rows_host,
+            jax.ShapeDtypeStruct(
+                (ids_j.shape[0], self.hidden_size), jnp.bfloat16),
+            ids_j,
+        )
+        return torch_view(rows).reshape(tuple(ids_t.shape) +
+                                        (self.hidden_size, ))
+
+    def load_weights(self,
+                     weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+        loaded: set = set()
+        for name, tensor in weights:
+            rows = tensor.shape[0]
+            self.host_table[:rows] = (
+                tensor.contiguous().view(torch.uint16).cpu().numpy().view(
+                    self._host_dtype))
+            loaded.add(name)
+        return loaded
+
+
 class Qwen4ExpModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -315,8 +367,15 @@ class Qwen4ExpModel(nn.Module):
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size,
-                                                   config.hidden_size)
+        if envs.QWEN4_EXP_HOST_EMBEDDING:
+            self.embed_tokens = Qwen4ExpHostEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(self.vocab_size,
+                                                       config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
