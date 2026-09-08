@@ -312,6 +312,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) else None,
+    # Process MoE requantization in chunks of this many local experts, with
+    # each chunk's result staged to host. 0 = process all local experts in
+    # one program (default). Set on capacity-limited devices (e.g. v5e-8)
+    # where the full-size requant program's output allocation exceeds the
+    # free HBM while the raw weights are still resident.
+    "MOE_REQUANTIZE_EXPERT_CHUNK":
+    lambda: int(chunk) if (chunk := os.getenv("MOE_REQUANTIZE_EXPERT_CHUNK"))
+    else 0,
     # Clip outlier weights before requantization at the given percentile
     # (e.g. 99.9). Reduces quantization error for large block sizes by
     # preventing extreme outliers from inflating the per-block scale.
