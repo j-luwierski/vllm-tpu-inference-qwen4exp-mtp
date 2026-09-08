@@ -565,9 +565,17 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             )
             del input_weights
 
-        # Free CPU memory now that weights have been safely transferred to TPU
+        # Free this layer's raw weight parameters before the final H2D: their
+        # device buffers fund the transfer of the processed weights (the raw
+        # and processed forms of one layer cannot coexist on v5e-8). The CPU
+        # storages are released right after.
+        delattr(layer, "w13_weight")
+        delattr(layer, "w2_weight")
+        delattr(layer, scale_w13_name)
+        delattr(layer, scale_w2_name)
         for t in raw.values():
             _free_torch_storage(t)
+        del raw
         try:
             st = jax.devices()[0].memory_stats()
             print(f"[CHUNKDBG] pre-final-put free_hbm={(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB", flush=True)
