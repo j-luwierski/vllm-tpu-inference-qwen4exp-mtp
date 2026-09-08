@@ -69,19 +69,34 @@ def shard_model_to_tpu(model: torch.nn.Module,
 
         params, buffers = _extract_all_params_buffers(model)
 
-        # For other weight tensors, repliate them on all the TPU chips.
-        for _name, _p in list(params.items()) + list(buffers.items()):
-            if _tensor_is_in_cpu(_p) and _p.numel() * _p.element_size(
-            ) > 4 * 2**20:
-                st = jax.devices()[0].memory_stats()
-                print(f"[CLNDBG2] {_name} shape={tuple(_p.shape)} "
-                      f"dtype={_p.dtype} free_before="
-                      f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
-                      flush=True)
-        params, buffers = pytree.tree_map_only(
-            _tensor_is_in_cpu,
-            lambda tensor: _shard_tensor_to_tpu_replicated(tensor, mesh),
-            (params, buffers))
+        # For other weight tensors, replicate them on all the TPU chips —
+        # except the hyper-connection low-rank projections: replicated they
+        # cost 1.9 GiB per chip across 48 layers (two GatedResidual mixers x
+        # (320, 10240) + (10240, 320)), which alone exhausted the HBM left
+        # after the requantized MoE. Shard them along the contraction dim;
+        # jax inserts the all-reduces automatically for the matmuls.
+        from tpu_inference.layers.vllm.quantization.unquantized import (
+            _host_numpy_view)
+
+        def _shard_named(_name: str, _p: torch.Tensor) -> torch.Tensor:
+            if _tensor_is_in_cpu(_p) and _p.dim() == 2 and (
+                    "input_mix_weight_down" in _name
+                    or "input_mix_weight_up" in _name):
+                np_view = _host_numpy_view(_p)
+                if np_view is not None:
+                    if _p.shape[0] * _p.shape[1] == 320 * 10240:
+                        if _p.shape[0] == 320:  # down: shard the input dim
+                            sharding = NamedSharding(mesh, P(None, "model"))
+                        else:  # up: shard the output dim
+                            sharding = NamedSharding(mesh, P("model", None))
+                        return torch_view(
+                            general_device_put(np_view, sharding))
+            return _shard_tensor_to_tpu_replicated(_p, mesh)
+
+        for _name, _p in list(params.items()):
+            params[_name] = _shard_named(_name, _p)
+        for _name, _b in list(buffers.items()):
+            buffers[_name] = _shard_named(_name, _b)
 
         return {**params, **buffers}
 
