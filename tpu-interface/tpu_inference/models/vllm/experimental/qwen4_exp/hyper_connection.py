@@ -148,13 +148,12 @@ class GatedResidual(nn.Module):
             "input_mix_weight_down",
             return_bias=False,
         )
+        # Column-parallel sharding with the implicit all-reduce of the
+        # partial outputs: the gate/residual math stays identical to the
+        # replicated version while the weight shards to (1280, 320) per chip.
         self.input_mix_weight_up = ColumnParallelLinear(
             config.hc_lowrank,
             self.hyper_hidden_size,
-            # reduce_results (the default) all-reduces the partial outputs,
-            # so the gate/residual math stays identical to the replicated
-            # version while the weight shards to (10240, 40) per chip.
-            reduce_results=True,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
