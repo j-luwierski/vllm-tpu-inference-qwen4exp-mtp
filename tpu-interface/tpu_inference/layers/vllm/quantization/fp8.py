@@ -417,10 +417,19 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
 
         layer._loaded_weights.add((param_name, expert_id, shard_id))
 
-        # For block-quantized FP8 MoE, each expert has 6 parameter shards:
-        # w1_weight, w1_weight_scale_inv, w3_weight, w3_weight_scale_inv,
-        # w2_weight, and w2_weight_scale_inv.
-        expected_shards = 6 * layer.global_num_experts
+        # For block-quantized FP8 MoE, each expert has either 4 parameter
+        # shards (fused gate/up: w13_weight, w13_weight_scale_inv, w2_weight,
+        # w2_weight_scale_inv — e.g. Qwen3.8-Flash-Next / Qwen3-Next style
+        # checkpoints) or 6 (unfused w1/w3: w1_weight, w1_weight_scale_inv,
+        # w3_weight, w3_weight_scale_inv, w2_weight, w2_weight_scale_inv).
+        # Count what this layer actually has: with the fused layout the old
+        # hard-coded 6/expert made the completion trigger unreachable (max
+        # 4*experts < 6*experts), so per-layer processing never fired and
+        # requantization ran only at end-of-load, when the device already
+        # holds the streamed weights and the requant program's output
+        # allocation fails (RESOURCE_EXHAUSTED on v5e-8).
+        shards_per_expert = 6 if hasattr(layer, "w3_weight") else 4
+        expected_shards = shards_per_expert * layer.global_num_experts
 
         if len(layer._loaded_weights) >= expected_shards:
             logger.debug(
