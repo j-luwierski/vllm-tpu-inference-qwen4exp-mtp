@@ -60,6 +60,14 @@ def shard_model_to_tpu(model: torch.nn.Module,
         params, buffers = _extract_all_params_buffers(model)
 
         # For other weight tensors, repliate them on all the TPU chips.
+        for _name, _p in list(params.items()) + list(buffers.items()):
+            if _tensor_is_in_cpu(_p) and _p.numel() * _p.element_size(
+            ) > 4 * 2**20:
+                st = jax.devices()[0].memory_stats()
+                print(f"[CLNDBG2] {_name} shape={tuple(_p.shape)} "
+                      f"dtype={_p.dtype} free_before="
+                      f"{(st['bytes_limit']-st['bytes_in_use'])/2**20:.0f}MiB",
+                      flush=True)
         params, buffers = pytree.tree_map_only(
             _tensor_is_in_cpu,
             lambda tensor: _shard_tensor_to_tpu_replicated(tensor, mesh),
