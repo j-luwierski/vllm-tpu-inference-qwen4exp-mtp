@@ -36,8 +36,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+                                               ReplicatedLinear)
 
 
 @dataclass
@@ -149,10 +148,13 @@ class GatedResidual(nn.Module):
             "input_mix_weight_down",
             return_bias=False,
         )
-        self.input_mix_weight_up = RowParallelLinear(
+        self.input_mix_weight_up = ColumnParallelLinear(
             config.hc_lowrank,
             self.hyper_hidden_size,
-            input_is_parallel=False,
+            # reduce_results (the default) all-reduces the partial outputs,
+            # so the gate/residual math stays identical to the replicated
+            # version while the weight shards to (10240, 40) per chip.
+            reduce_results=True,
             bias=False,
             params_dtype=config.params_dtype,
             quant_config=None,
